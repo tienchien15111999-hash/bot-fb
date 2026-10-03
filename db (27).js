@@ -75,40 +75,8 @@ async function init(sql) {
     updated_at TIMESTAMPTZ DEFAULT now()
   )`;
   await sql`CREATE INDEX IF NOT EXISTS idx_orders_conv ON orders (conversation_id, id DESC)`;
-  // Thông tin khách bot đã ghi nhớ (tên nhận hàng, SĐT, địa chỉ, màu/size) — bot không hỏi lại
-  await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS info JSONB`;
   await sql`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value JSONB NOT NULL
-  )`;
-  // Câu trả lời chuẩn do chủ shop dạy bot (trang Quản lý sản phẩm → Dạy bot)
-  await sql`CREATE TABLE IF NOT EXISTS bot_training (
-    id SERIAL PRIMARY KEY,
-    product_id TEXT,
-    context TEXT DEFAULT '',
-    customer_text TEXT NOT NULL,
-    reply_text TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now()
-  )`;
-  // Cả đoạn chat chuẩn do chủ shop dạy bot (nút "Dạy bot" ở trang chat chính)
-  // Member cấp dưới: chỉ thấy các Page / sản phẩm được chủ shop cấp quyền
-  await sql`CREATE TABLE IF NOT EXISTS members (
-    id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    name TEXT DEFAULT '',
-    salt TEXT NOT NULL,
-    hash TEXT NOT NULL,
-    page_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-    product_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT now()
-  )`;
-  await sql`CREATE TABLE IF NOT EXISTS bot_training_chats (
-    id SERIAL PRIMARY KEY,
-    title TEXT DEFAULT '',
-    product_id TEXT,
-    messages JSONB NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
   )`;
 }

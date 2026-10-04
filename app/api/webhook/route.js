@@ -4,7 +4,7 @@
 //   https://your-domain.com/api/webhook
 
 import { put } from "@vercel/blob";
-import { getProducts, filterProductsForPage, formatProductsForPrompt, norm, normKey, matchProduct } from "@/lib/products";
+import { getProducts, filterProductsForPage, formatProductsForPrompt, norm, normKey, matchProduct, openingImageList } from "@/lib/products";
 import {
   addMessage,
   ensureProfile,
@@ -28,9 +28,11 @@ import {
   hasNewerDifferentCustomerMessage,
   getCustomerInfo,
   getLastOutgoingAgeMs,
+  getRecentOutgoingTexts,
   mergeCustomerInfo,
   extractPhone,
 } from "@/lib/conversations";
+import { isRepeatedQuestion } from "@/lib/replyDedupe";
 import { getSettings } from "@/lib/settings";
 import { getPageToken, isPageBotEnabled } from "@/lib/pages";
 import { getAllRawKeys } from "@/lib/apiKeys";
@@ -82,6 +84,8 @@ const REPLY_DEBOUNCE_MS = process.env.REPLY_DEBOUNCE_MS !== undefined ? Number(p
 // chờ ngần này ms cho khách gõ xong rồi trả lời MỘT lần. Tin ĐẦU của khách vẫn trả lời nhanh, không chờ. Đặt 0 để tắt.
 const BURST_WAIT_MS = process.env.BURST_WAIT_MS !== undefined ? Number(process.env.BURST_WAIT_MS) : 2500;
 const BURST_RECENT_MS = process.env.BURST_RECENT_MS !== undefined ? Number(process.env.BURST_RECENT_MS) : 10000;
+// Bot không hỏi lại câu hỏi gần giống 1 trong N tin chữ gần nhất của bot/shop gửi cho khách này (mặc định 3). Đặt 0 để tắt.
+const NO_REPEAT_QUESTION_LAST = process.env.NO_REPEAT_QUESTION_LAST !== undefined ? Number(process.env.NO_REPEAT_QUESTION_LAST) : 3;
 const SECOND_MSG_HOLD_MS = process.env.SECOND_MSG_HOLD_MS !== undefined ? Number(process.env.SECOND_MSG_HOLD_MS) : 1000;
 // Tin đầu tiên: giả gõ từ lúc nhận tin của khách, gửi sau 1s (câu ngắn) đến 1,5s (câu dài). AI soạn lâu hơn thì gửi ngay khi soạn xong.
 const TYPING_MIN_MS = process.env.TYPING_MIN_MS !== undefined ? Number(process.env.TYPING_MIN_MS) : 1000;
@@ -169,15 +173,18 @@ export async function POST(req) {
 
         // Khách MỚI nhắn liền mấy tin: chờ một chút cho khách gõ xong, chỉ tin CUỐI CÙNG của loạt mới đi tiếp
         // (các tin trước tự dừng) → bot chỉ trả lời 1 lần duy nhất.
+        const firstWaitMs = Number.isFinite(Number(settings.firstContactWaitSec)) && settings.firstContactWaitSec !== "" && settings.firstContactWaitSec !== undefined && settings.firstContactWaitSec !== null
+          ? Math.max(0, Number(settings.firstContactWaitSec)) * 1000
+          : FIRST_CONTACT_WAIT_MS;
         const firstContact =
-          FIRST_CONTACT_WAIT_MS > 0 &&
+          firstWaitMs > 0 &&
           !!messageId &&
           !(await hasOutgoingMessage(senderId).catch(() => true)) &&
           (await getLastOpeningAgeMs(senderId).catch(() => 0)) === null;
         if (firstContact) {
           // Chờ đủ FIRST_CONTACT_WAIT_MS tính từ tin ĐẦU TIÊN của khách (không phải từ tin vừa nhận)
           const firstAge = (await getFirstPendingCustomerAgeMs(senderId).catch(() => 0)) || 0;
-          await sleep(Math.max(0, FIRST_CONTACT_WAIT_MS - firstAge));
+          await sleep(Math.max(0, firstWaitMs - firstAge));
           const latestId = await getLatestCustomerMessageId(senderId).catch(() => messageId);
           if (latestId && Number(latestId) > Number(messageId)) {
             console.log("Khách mới nhắn liền nhiều tin → để tin cuối cùng trả lời:", text);
@@ -285,6 +292,14 @@ export async function POST(req) {
               if (i === 0 && openedProductId) await releaseOpening(senderId, openedProductId).catch(() => {});
               return false;
             }
+            // Câu hỏi này gần giống câu bot/shop vừa hỏi (vd 2 luồng trả lời chồng nhau) → bỏ câu này, gửi tiếp các câu khác
+            if (NO_REPEAT_QUESTION_LAST > 0 && !reply.openingProductId) {
+              const recent = await getRecentOutgoingTexts(senderId, 0, NO_REPEAT_QUESTION_LAST).catch(() => []);
+              if (isRepeatedQuestion(messages[i], recent)) {
+                console.log("Bỏ câu hỏi lặp lại câu đã hỏi:", messages[i]);
+                continue;
+              }
+            }
             const delivered = await sendMessage(senderId, messages[i], pageToken);
             if (!delivered) {
               // Facebook từ chối (quá 24 giờ, token hết hạn...) → KHÔNG lưu như đã gửi, để bot/shop không tưởng khách đã nhận
@@ -301,8 +316,11 @@ export async function POST(req) {
         const sendImages = async () => {
           if (!images.length) return;
           if (await superseded()) return; // khách đã nhắn thêm → không gửi ảnh cũ
-          // Gom toàn bộ ảnh vào 1 tin nhắn (carousel vuốt ngang) thay vì gửi rời từng ảnh
-          await sendImagesGrouped(senderId, imageItems?.length ? imageItems : images.map((url) => ({ url })), pageToken);
+          // Gửi từng ảnh một (mỗi ảnh 1 tin), theo đúng thứ tự
+          for (let i = 0; i < images.length; i++) {
+            if (i > 0) await sleep(600);
+            await sendImage(senderId, images[i], pageToken);
+          }
           await addMessage(senderId, "bot", imageNote, images, pageId).catch(() => {});
         };
 
@@ -426,8 +444,8 @@ function openingAlreadySent(history, p) {
 }
 
 function openingReply(p) {
-  // Mở đầu chỉ gửi ảnh mẫu. Ảnh thực tế để dành, khách hỏi mới gửi.
-  const images = (p.sampleImages || []).slice(0, MAX_OPENING_IMAGES);
+  // Mở đầu chỉ gửi những ảnh chủ shop đã tick. Ảnh không tick để dành, khách hỏi mới gửi.
+  const images = openingImageList(p, MAX_OPENING_IMAGES);
   const labels = p.imageLabels || {};
   return {
     messages: openingMessages(p),
@@ -1063,42 +1081,4 @@ async function sendImage(recipientId, imageUrl, token) {
     message: { attachment: { type: "image", payload: { url: imageUrl, is_reusable: true } } },
     messaging_type: "RESPONSE",
   }, token);
-}
-
-/**
- * Gửi nhiều ảnh trong 1 tin nhắn: Messenger chỉ cho 1 attachment/tin nên dùng template "generic"
- * (carousel vuốt ngang, tối đa 10 thẻ/tin). Chỉ 1 ảnh → gửi ảnh thường.
- * Nếu Facebook từ chối carousel thì tự quay về gửi từng ảnh theo thứ tự.
- */
-async function sendImagesGrouped(recipientId, items, token) {
-  if (items.length === 1) return void (await sendImage(recipientId, items[0].url, token));
-
-  for (let i = 0; i < items.length; i += 10) {
-    const chunk = items.slice(i, i + 10);
-    const ok = await fbPost({
-      recipient: { id: recipientId },
-      message: {
-        attachment: {
-          type: "template",
-          payload: {
-            template_type: "generic",
-            image_aspect_ratio: "square",
-            elements: chunk.map((it, j) => {
-              const n = i + j + 1;
-              return {
-                title: String(it.title || "Ảnh sản phẩm").slice(0, 80), // title là bắt buộc
-                // Gợi ý vuốt ngay trên từng thẻ để khách biết còn ảnh/màu khác
-                subtitle: n < items.length ? `Mẫu ${n}/${items.length} · Vuốt sang phải ➡️ xem thêm` : `Mẫu ${n}/${items.length} · Mẫu cuối`,
-                image_url: it.url,
-              };
-            }),
-          },
-        },
-      },
-      messaging_type: "RESPONSE",
-    }, token);
-    if (!ok) {
-      for (const it of chunk) await sendImage(recipientId, it.url, token);
-    }
-  }
 }

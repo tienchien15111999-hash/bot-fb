@@ -13,6 +13,7 @@ const EMPTY_FORM = {
   triggerQuestions: "",
   sampleImages: [],
   realImages: [],
+  openingImages: [], // ảnh được TICK để gửi kèm câu mở đầu (theo thứ tự tick)
   imageLabels: {},
 };
 
@@ -84,7 +85,7 @@ async function uploadImage(file) {
   return data.url;
 }
 
-function ImagePicker({ title, hint, urls, labels, onLabel, onChange }) {
+function ImagePicker({ title, hint, urls, labels, onLabel, onChange, ticked, onToggle }) {
   const inputRef = useRef(null);
   const [busy, setBusy] = useState(0);
   const [error, setError] = useState("");
@@ -113,6 +114,11 @@ function ImagePicker({ title, hint, urls, labels, onLabel, onChange }) {
         <div>
           <strong style={{ fontSize: 14 }}>{title}</strong>
           <div style={{ color: "#888", fontSize: 12 }}>{hint}</div>
+          {onToggle && (
+            <div style={{ color: "#16a34a", fontSize: 12, marginTop: 2 }}>
+              ✔ Bấm ô vuông góc trái ảnh để chọn ảnh gửi kèm câu mở đầu (số = thứ tự gửi). Không tick ảnh nào = mở đầu không gửi ảnh.
+            </div>
+          )}
         </div>
         <button
           type="button"
@@ -170,6 +176,31 @@ function ImagePicker({ title, hint, urls, labels, onLabel, onChange }) {
                 >
                   ×
                 </button>
+                {onToggle && (
+                  <button
+                    type="button"
+                    onClick={() => onToggle(u)}
+                    aria-label="Chọn gửi kèm câu mở đầu"
+                    title="Tick để gửi ảnh này kèm câu mở đầu"
+                    style={{
+                      position: "absolute",
+                      top: 4,
+                      left: 4,
+                      minWidth: 26,
+                      height: 26,
+                      borderRadius: 6,
+                      border: ticked?.includes(u) ? "2px solid #16a34a" : "2px solid #fff",
+                      background: ticked?.includes(u) ? "#16a34a" : "rgba(0,0,0,0.45)",
+                      color: "#fff",
+                      cursor: "pointer",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      padding: 0,
+                    }}
+                  >
+                    {ticked?.includes(u) ? ticked.indexOf(u) + 1 : ""}
+                  </button>
+                )}
               </div>
               <input
                 value={labels?.[u] || ""}
@@ -218,7 +249,8 @@ function cleanForm(form) {
     if (keep.has(u) && String(v).trim()) imageLabels[u] = String(v).trim();
   }
   const openingExtras = (form.openingExtras || []).map((t) => String(t || "").trim()).filter(Boolean);
-  return { ...form, imageLabels, openingExtras };
+  const openingImages = (form.openingImages || []).filter((u) => keep.has(u));
+  return { ...form, imageLabels, openingExtras, openingImages };
 }
 
 export default function AdminPage() {
@@ -230,6 +262,9 @@ export default function AdminPage() {
   const [botPrompt, setBotPrompt] = useState("");
   const [promptSaved, setPromptSaved] = useState("");
   const [promptStatus, setPromptStatus] = useState("");
+  const [firstWait, setFirstWait] = useState("12"); // giây chờ trước khi bot trả lời câu đầu tiên của khách mới
+  const [firstWaitSaved, setFirstWaitSaved] = useState("12");
+  const [firstWaitStatus, setFirstWaitStatus] = useState("");
   const [openId, setOpenId] = useState(null); // sản phẩm đang mở rộng trong danh sách
   const [copyFromId, setCopyFromId] = useState("");
   const [copyParts, setCopyParts] = useState({
@@ -267,9 +302,34 @@ export default function AdminPage() {
       .then((s) => {
         setBotPrompt(s.botPrompt || "");
         setPromptSaved(s.botPrompt || "");
+        const w = s.firstContactWaitSec === undefined || s.firstContactWaitSec === null || s.firstContactWaitSec === "" ? "12" : String(s.firstContactWaitSec);
+        setFirstWait(w);
+        setFirstWaitSaved(w);
       })
       .catch(() => {});
   }, []);
+
+  async function saveFirstWait() {
+    const n = Number(firstWait);
+    if (firstWait === "" || !Number.isFinite(n) || n < 0 || n > 40) {
+      setFirstWaitStatus("Nhập số giây từ 0 đến 40");
+      return;
+    }
+    setFirstWaitStatus("Đang lưu...");
+    const res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ firstContactWaitSec: n }),
+    });
+    if (res.ok) {
+      setFirstWaitSaved(String(n));
+      setFirstWait(String(n));
+      setFirstWaitStatus("Đã lưu ✓");
+    } else {
+      setFirstWaitStatus("Lưu thất bại, thử lại nhé");
+    }
+    setTimeout(() => setFirstWaitStatus(""), 2500);
+  }
 
   async function savePrompt() {
     setPromptStatus("Đang lưu...");
@@ -312,6 +372,13 @@ export default function AdminPage() {
     setSaving(false);
   }
 
+  function toggleOpening(url) {
+    setForm((f) => {
+      const cur = f.openingImages || [];
+      return { ...f, openingImages: cur.includes(url) ? cur.filter((u) => u !== url) : [...cur, url] };
+    });
+  }
+
   function setLabel(url, value) {
     setForm((f) => ({ ...f, imageLabels: { ...f.imageLabels, [url]: value } }));
   }
@@ -328,6 +395,8 @@ export default function AdminPage() {
       triggerQuestions: p.triggerQuestions || "",
       sampleImages: p.sampleImages || [],
       realImages: p.realImages || [],
+      // sản phẩm cũ chưa tick lần nào: coi như đang tick hết ảnh mẫu (đúng với cách bot đang gửi)
+      openingImages: Array.isArray(p.openingImages) ? p.openingImages : p.sampleImages || [],
       imageLabels: p.imageLabels || {},
     });
     setEditingId(p.id);
@@ -349,6 +418,10 @@ export default function AdminPage() {
           for (const u of add) if (src.imageLabels?.[u]) next.imageLabels[u] = src.imageLabels[u];
         }
       }
+      const srcTicked = Array.isArray(src.openingImages) ? src.openingImages : src.sampleImages || [];
+      const allNow = [...next.sampleImages, ...next.realImages];
+      next.openingImages = [...(f.openingImages || [])];
+      for (const u of srcTicked) if (allNow.includes(u) && !next.openingImages.includes(u)) next.openingImages.push(u);
       return next;
     });
   }
@@ -374,6 +447,8 @@ export default function AdminPage() {
       triggerQuestions: "", // để trống: nếu trùng câu hỏi quảng cáo, bot sẽ nhầm sang sản phẩm cũ
       sampleImages: p.sampleImages || [],
       realImages: p.realImages || [],
+      // sản phẩm cũ chưa tick lần nào: coi như đang tick hết ảnh mẫu (đúng với cách bot đang gửi)
+      openingImages: Array.isArray(p.openingImages) ? p.openingImages : p.sampleImages || [],
       imageLabels: p.imageLabels || {},
     });
     setEditingId(null);
@@ -441,6 +516,31 @@ export default function AdminPage() {
         style={{ border: "1px solid #e2e2e2", borderRadius: 10, padding: "12px 16px", marginBottom: 20, background: "#fafafa" }}
       >
         <summary style={{ cursor: "pointer", fontWeight: 600 }}>Thông tin & quy tắc của shop cho bot</summary>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", margin: "12px 0", padding: "10px 12px", background: "#fff", border: "1px solid #e2e2e2", borderRadius: 8 }}>
+          <strong style={{ fontSize: 14 }}>Thời gian chờ câu đầu tiên:</strong>
+          <input
+            type="number"
+            min="0"
+            max="40"
+            step="1"
+            value={firstWait}
+            onChange={(e) => setFirstWait(e.target.value)}
+            style={{ ...inputStyle, width: 70 }}
+          />
+          <span style={{ fontSize: 14 }}>giây</span>
+          <button
+            type="button"
+            onClick={saveFirstWait}
+            disabled={firstWait === firstWaitSaved}
+            style={{ ...btn, background: "#111", color: "#fff", border: "none", opacity: firstWait === firstWaitSaved ? 0.5 : 1 }}
+          >
+            Lưu
+          </button>
+          <span style={{ color: "#2d7a3a", fontSize: 13 }}>{firstWaitStatus}</span>
+          <div style={{ width: "100%", color: "#666", fontSize: 12 }}>
+            Khách mới nhắn lần đầu: bot chờ ngần này giây (cho khách gõ xong) rồi mới gửi ảnh mẫu + câu mở đầu. Nhập 0 = trả lời ngay.
+          </div>
+        </div>
         <p style={{ color: "#666", fontSize: 13 }}>
           Ghi những gì bot cần biết để tư vấn giống người thật: phí ship, thời gian giao, bảo hành, đổi trả, khuyến mãi,
           SĐT/Zalo, giờ làm việc, cách xưng hô riêng...
@@ -674,6 +774,8 @@ export default function AdminPage() {
           labels={form.imageLabels}
           onLabel={setLabel}
           onChange={(urls) => setForm((f) => ({ ...f, sampleImages: urls }))}
+          ticked={form.openingImages}
+          onToggle={toggleOpening}
         />
         <ImagePicker
           title="Ảnh sản phẩm thực tế"
@@ -682,6 +784,8 @@ export default function AdminPage() {
           labels={form.imageLabels}
           onLabel={setLabel}
           onChange={(urls) => setForm((f) => ({ ...f, realImages: urls }))}
+          ticked={form.openingImages}
+          onToggle={toggleOpening}
         />
         <div style={{ display: "flex", gap: 8 }}>
           <button

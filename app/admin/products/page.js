@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { ChatIcon, navButtonStyle } from "../icons";
+import { ladderRows, ladderPreview, parseMoney } from "@/lib/priceLadder";
 
 const EMPTY_FORM = {
   pageIds: [], // [] = dùng chung cho mọi Page; nhiều ID = chỉ các Page đó
@@ -8,11 +9,17 @@ const EMPTY_FORM = {
   stock: "Còn hàng",
   description: "",
   notes: "",
+  modelInfo: "", // thông tin bạn mẫu trong ảnh thực tế (cao, nặng, size...) — bot nói khi ảnh đã gửi rồi
+  attributeGroups: [], // BỘ THUỘC TÍNH: [{ name, members: [tên thuộc tính], ask }]
+  attributes: [], // BẢNG THUỘC TÍNH: [{ name, values, how }] vd Màu / Chiều dài / Size
+  shipFee: "", // phí ship 1 đơn (đồng); để trống = không tính / freeship
+  priceLadder: [], // BẢNG GIÁ MẶC CẢ: [{ qty, list, steps, floor }] — hệ thống tự mặc cả đúng mức, bot không thấy giá sàn
   openingScript: "",
   openingExtras: [], // các tin phụ gửi tiếp sau câu mở đầu (nút +)
   triggerQuestions: "",
   sampleImages: [],
   realImages: [],
+  catalogImages: [], // ảnh TỔNG HỢP tất cả mẫu mã/màu — bot gửi khi khách hỏi "có mấy màu / mẫu nào"
   openingImages: [], // ảnh được TICK để gửi kèm câu mở đầu (theo thứ tự tick)
   imageLabels: {},
 };
@@ -85,7 +92,25 @@ async function uploadImage(file) {
   return data.url;
 }
 
-function ImagePicker({ title, hint, urls, labels, onLabel, onChange, ticked, onToggle }) {
+// Khung bấm để sổ ra / thu lại cho từng đầu mục
+function has(v) {
+  return String(v || "").trim().length > 0;
+}
+function Fold({ title, note, filled, children }) {
+  return (
+    <details data-fold="1" style={{ border: "1px solid #e2e2e2", borderRadius: 8, background: "#fff" }}>
+      <summary style={{ cursor: "pointer", padding: "10px 12px", fontWeight: 600, fontSize: 14 }}>
+        {title}
+        {note ? (
+          <span style={{ marginLeft: 8, fontWeight: 400, fontSize: 12, color: filled ? "#16a34a" : "#999" }}>{note}</span>
+        ) : null}
+      </summary>
+      <div style={{ padding: "0 12px 12px" }}>{children}</div>
+    </details>
+  );
+}
+
+function ImagePicker({ title, hint, urls, labels, onLabel, onChange, ticked, onToggle, bare = false }) {
   const inputRef = useRef(null);
   const [busy, setBusy] = useState(0);
   const [error, setError] = useState("");
@@ -109,10 +134,10 @@ function ImagePicker({ title, hint, urls, labels, onLabel, onChange, ticked, onT
   }
 
   return (
-    <div style={{ border: "1px dashed #cfcfcf", borderRadius: 8, padding: 12, background: "#fff" }}>
+    <div style={bare ? { background: "#fff" } : { border: "1px dashed #cfcfcf", borderRadius: 8, padding: 12, background: "#fff" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
         <div>
-          <strong style={{ fontSize: 14 }}>{title}</strong>
+          {!bare && <strong style={{ fontSize: 14 }}>{title}</strong>}
           <div style={{ color: "#888", fontSize: 12 }}>{hint}</div>
           {onToggle && (
             <div style={{ color: "#16a34a", fontSize: 12, marginTop: 2 }}>
@@ -202,13 +227,13 @@ function ImagePicker({ title, hint, urls, labels, onLabel, onChange, ticked, onT
                   </button>
                 )}
               </div>
-              <input
+              {onLabel && <input
                 value={labels?.[u] || ""}
                 onChange={(e) => onLabel(u, e.target.value)}
                 placeholder="Tên ảnh (vd: Váy trắng)"
                 aria-label="Tên ảnh"
                 style={{ width: "100%", boxSizing: "border-box", marginTop: 4, padding: "5px 6px", fontSize: 12, border: "1px solid #ddd", borderRadius: 5 }}
-              />
+              />}
             </div>
           ))}
         </div>
@@ -241,6 +266,245 @@ function Thumbs({ label, urls, labels }) {
   );
 }
 
+// BẢNG GIÁ MẶC CẢ: chủ shop điền 1 lần → hệ thống tự mặc cả đúng mức, bot KHÔNG nhìn thấy giá sàn
+function PriceLadderTable({ rows, onChange }) {
+  const list = rows || [];
+  const inp = { padding: "8px 10px", border: "1px solid #ccc", borderRadius: 6, fontSize: 14, boxSizing: "border-box" };
+  const small = { display: "block", fontSize: 12, color: "#666", marginBottom: 2 };
+  const setRow = (i, patch) => onChange(list.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const parsed = ladderRows({ priceLadder: list });
+  const warnings = [];
+  list.forEach((r, i) => {
+    const any = ["qty", "list", "steps", "floor"].some((k) => String(r[k] || "").trim());
+    if (!any) return;
+    const q = parseInt(String(r.qty || "").replace(/\D/g, ""), 10);
+    const pr = parsed.find((x) => x.qty === q);
+    if (!pr || String(r.list || "").trim() === "") {
+      warnings.push(`Dòng ${i + 1}: chưa hiểu. Kiểm tra Số lượng và Giá niêm yết (mỗi số lượng chỉ ghi 1 dòng).`);
+      return;
+    }
+    const tokens = String(r.steps || "").split(/[;,\n|→>]+/).map((x) => x.trim()).filter(Boolean);
+    if (tokens.length > pr.steps.length) warnings.push(`Dòng ${i + 1}: có mức giảm bị bỏ qua (mỗi mức phải thấp hơn giá niêm yết và không thấp hơn giá sàn).`);
+    if (String(r.floor || "").trim() && parseMoney(r.floor) == null) warnings.push(`Dòng ${i + 1}: giá sàn chưa hiểu.`);
+  });
+  const nextQty = Math.max(0, ...parsed.map((x) => x.qty)) + 1;
+  return (
+    <Fold title="Bảng giá mặc cả (không bắt buộc)" note={parsed.length ? `${parsed.length} dòng` : "chưa có"} filled={parsed.length > 0}>
+      <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
+        Điền để bot tự mặc cả đúng mức và không lộ giá sàn. Mọi số tiền là TỔNG TIỀN cho số lượng đó (vd mua 2 cái giá 350k thì ghi 350k). Khách đưa giá không thấp hơn giá sàn thì bot đồng ý luôn.
+        Khách đưa giá thấp hơn, hoặc chỉ nói “bớt đi”, thì bot hạ dần theo các mức giảm; hết mức thì giữ nguyên. Không điền thì bot vẫn mặc cả theo ô “Lưu ý cho bot” như cũ.
+      </div>
+      <div style={{ color: "#b45309", fontSize: 12, marginBottom: 8 }}>
+        Điền xong, nhớ XÓA các dòng nói về mặc cả / giá sàn trong ô “Lưu ý cho bot”, nếu không bot vẫn nhìn thấy giá sàn.
+      </div>
+      {list.map((r, i) => (
+        <div key={i} style={{ border: "1px solid #e5e5e5", borderRadius: 8, padding: 10, marginBottom: 8, background: "#fafafa" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+            <label style={{ width: 80 }}>
+              <span style={small}>Số lượng</span>
+              <input style={{ ...inp, width: "100%" }} inputMode="numeric" value={r.qty} placeholder="1" onChange={(e) => setRow(i, { qty: e.target.value })} />
+            </label>
+            <label style={{ flex: 1 }}>
+              <span style={small}>Giá niêm yết</span>
+              <input style={{ ...inp, width: "100%" }} value={r.list} placeholder="vd: 185k" onChange={(e) => setRow(i, { list: e.target.value })} />
+            </label>
+            <button
+              type="button"
+              title="Xóa dòng này"
+              onClick={() => onChange(list.filter((_, j) => j !== i))}
+              style={{ padding: "8px 12px", border: "1px solid #e0b4b4", background: "#fff", color: "#c00", borderRadius: 6, cursor: "pointer" }}
+            >
+              ✕
+            </button>
+          </div>
+          <label style={{ display: "block", marginTop: 8 }}>
+            <span style={small}>Các mức giảm, từ cao xuống thấp (cách nhau dấu phẩy)</span>
+            <input style={{ ...inp, width: "100%" }} value={r.steps} placeholder="vd: 175k, 165k" onChange={(e) => setRow(i, { steps: e.target.value })} />
+          </label>
+          <label style={{ display: "block", marginTop: 8 }}>
+            <span style={small}>Giá sàn: thấp nhất bạn chấp nhận (để trống = mức giảm cuối cùng)</span>
+            <input style={{ ...inp, width: "100%" }} value={r.floor} placeholder="vd: 160k" onChange={(e) => setRow(i, { floor: e.target.value })} />
+          </label>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => onChange([...list, { qty: String(nextQty), list: "", steps: "", floor: "" }])}
+        style={{ padding: "8px 14px", border: "1px solid #ccc", background: "#fff", borderRadius: 6, cursor: "pointer", fontSize: 14 }}
+      >
+        + Thêm số lượng
+      </button>
+      {parsed.length > 0 && (
+        <div style={{ marginTop: 10, padding: "8px 10px", background: "#f1faf1", borderRadius: 6, fontSize: 13, color: "#256029" }}>
+          <div style={{ fontSize: 12, marginBottom: 2 }}>Hệ thống hiểu như sau:</div>
+          {ladderPreview(parsed).map((t, i) => (
+            <div key={i}>{t}</div>
+          ))}
+        </div>
+      )}
+      {warnings.map((w, i) => (
+        <div key={i} style={{ marginTop: 6, color: "#b45309", fontSize: 12 }}>
+          ⚠ {w}
+        </div>
+      ))}
+    </Fold>
+  );
+}
+
+// Ô nhập nhiều dòng tự giãn chiều cao theo chữ đang gõ (không phải kéo, không bị nhỏ)
+function AutoTextarea({ value, minRows = 3, style, ...rest }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + 2 + "px";
+  }, [value]);
+  return <textarea ref={ref} rows={minRows} value={value} style={{ ...style, overflow: "hidden", resize: "vertical" }} {...rest} />;
+}
+
+// Bảng thuộc tính của sản phẩm: mỗi dòng gồm Thuộc tính / Giá trị / Cách chọn. Bot đọc bảng này để biết cần hỏi khách những mục nào.
+function AttributeTable({ rows, groups, onChange }) {
+  const list = Array.isArray(rows) ? rows : [];
+  const glist = Array.isArray(groups) ? groups : [];
+  const cell = { padding: "8px 10px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14, width: "100%", boxSizing: "border-box" };
+  function setRow(i, key, value) {
+    const old = String(list[i]?.name || "").trim();
+    const nextRows = list.map((r, idx) => (idx === i ? { ...r, [key]: value } : r));
+    // đổi tên thuộc tính thì cập nhật luôn tên trong các bộ
+    const nextGroups = key === "name" && old ? glist.map((g) => ({ ...g, members: (g.members || []).map((m) => (m === old ? String(value).trim() : m)) })) : glist;
+    onChange(nextRows, nextGroups);
+  }
+  function setGroup(gi, patch) {
+    onChange(list, glist.map((g, idx) => (idx === gi ? { ...g, ...patch } : g)));
+  }
+  function toggleMember(gi, name) {
+    const g = glist[gi];
+    const has = (g.members || []).includes(name);
+    setGroup(gi, { members: has ? g.members.filter((m) => m !== name) : [...(g.members || []), name] });
+  }
+  const filledRows = list.filter((r) => has(r.name)).length;
+  return (
+    <>
+      <Fold title="Bảng thuộc tính (không bắt buộc)" note={filledRows ? `${filledRows} dòng` : "chưa có"} filled={filledRows > 0}>
+      <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
+        Liệt kê những gì khách phải chọn (Màu, Chiều dài, Size...). Bot hỏi lần lượt từng dòng, chọn đủ rồi mới xin số điện thoại và địa chỉ.
+        Phần “Cách chọn” viết chữ bình thường: ghi “theo chiều cao và cân nặng” thì bot xin cả hai; chỉ ghi “theo chiều cao” thì bot chỉ xin chiều cao; ghi “khách tự chọn” thì bot hỏi khách lấy loại nào.
+        Khách đã tự nói giá trị (vd “size L”) thì bot không hỏi lại dòng đó.
+        Phần “Câu hỏi bồi”: câu bạn muốn bot dùng khi hỏi / nhắn lại khi khách im lặng về mục đó; để trống thì bot tự soạn. Viết nhiều câu (mỗi câu 1 dòng) thì bot hỏi lần lượt theo thứ tự câu 1, 2, 3… hết thì quay lại câu 1, nên không bị lặp.
+      </div>
+      {list.map((r, i) => (
+        <div key={i} style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 10, background: "#fafafa" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "#555" }}>Thuộc tính {i + 1}</span>
+            <button
+              type="button"
+              title="Xóa thuộc tính này"
+              onClick={() => onChange(list.filter((_, idx) => idx !== i), glist.map((g) => ({ ...g, members: (g.members || []).filter((m) => m !== String(list[i]?.name || "").trim()) })))}
+              style={{ padding: "4px 10px", border: "1px solid #ccc", borderRadius: 6, background: "#fff", cursor: "pointer", color: "#c00" }}
+            >
+              ✕ Xóa
+            </button>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            <div style={{ flex: "1 1 140px" }}>
+              <div style={{ fontSize: 12, color: "#666", marginBottom: 2 }}>Tên thuộc tính</div>
+              <input style={cell} placeholder="vd: Chiều dài" value={r.name || ""} onChange={(e) => setRow(i, "name", e.target.value)} />
+            </div>
+            <div style={{ flex: "2 1 200px" }}>
+              <div style={{ fontSize: 12, color: "#666", marginBottom: 2 }}>Giá trị (cách nhau dấu phẩy)</div>
+              <input style={cell} placeholder="vd: 60cm, 70cm, 80cm" value={r.values || ""} onChange={(e) => setRow(i, "values", e.target.value)} />
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: "#666", marginBottom: 2 }}>Cách chọn</div>
+          <AutoTextarea
+            minRows={2}
+            style={{ ...cell, marginBottom: 8 }}
+            placeholder="vd: theo chiều cao: dưới 1m55 lấy 60cm, 1m55-1m62 lấy 70cm, trên 1m62 lấy 80cm"
+            value={r.how || ""}
+            onChange={(e) => setRow(i, "how", e.target.value)}
+          />
+          <div style={{ fontSize: 12, color: "#666", marginBottom: 2 }}>Câu hỏi bồi — mỗi câu 1 dòng, bot hỏi lần lượt theo thứ tự câu 1, 2, 3… (để trống = bot tự hỏi)</div>
+          <AutoTextarea
+            minRows={3}
+            style={cell}
+            placeholder={"Câu 1: Chị gửi em cân nặng để em chọn size cho vừa nha?\nCâu 2: Chị nặng bao nhiêu ký để em tư vấn size ạ?\nCâu 3: Cho em xin cân nặng của chị nhé"}
+            value={r.ask || ""}
+            onChange={(e) => setRow(i, "ask", e.target.value)}
+          />
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => onChange([...list, { name: "", values: "", how: "", ask: "" }], glist)}
+        style={{ marginTop: 8, padding: "6px 12px", border: "1px solid #ccc", borderRadius: 6, background: "#fff", cursor: "pointer" }}
+      >
+        + Thêm dòng
+      </button>
+
+      </Fold>
+      <Fold title="Bộ thuộc tính (không bắt buộc)" note={glist.length ? `${glist.length} bộ` : "chưa có"} filled={glist.length > 0}>
+      <div>
+        <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
+          Gom nhiều thuộc tính ở trên thành 1 bộ rồi viết 1 câu hỏi bồi chung. Khách chưa nói gì về CẢ bộ thì bot hỏi đúng câu của bộ.
+          Nếu bộ đã có 1 dòng (vd khách đã nói chiều cao) thì bot chạy như bình thường: hỏi nốt dòng còn thiếu. Mỗi bộ cần chọn ít nhất 2 thuộc tính.
+        </div>
+        {glist.map((g, gi) => (
+          <div key={gi} style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 8, background: "#fafafa" }}>
+            <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+              <input
+                style={cell}
+                placeholder="Tên bộ (để bạn dễ nhớ), vd: Số đo người"
+                value={g.name || ""}
+                onChange={(e) => setGroup(gi, { name: e.target.value })}
+              />
+              <button
+                type="button"
+                title="Xóa bộ này"
+                onClick={() => onChange(list, glist.filter((_, idx) => idx !== gi))}
+                style={{ padding: "6px 10px", border: "1px solid #ccc", borderRadius: 6, background: "#fff", cursor: "pointer", color: "#c00" }}
+              >
+                ✕
+              </button>
+            </div>
+            <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>Chọn các thuộc tính thuộc bộ:</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 6 }}>
+              {list.filter((r) => String(r.name || "").trim()).length === 0 && <span style={{ fontSize: 12, color: "#999" }}>(Hãy nhập tên thuộc tính ở bảng trên trước)</span>}
+              {list
+                .filter((r) => String(r.name || "").trim())
+                .map((r) => {
+                  const nm = String(r.name).trim();
+                  return (
+                    <label key={nm} style={{ fontSize: 14, display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                      <input type="checkbox" checked={(g.members || []).includes(nm)} onChange={() => toggleMember(gi, nm)} />
+                      {nm}
+                    </label>
+                  );
+                })}
+            </div>
+            <div style={{ fontSize: 12, color: "#666", marginBottom: 2 }}>Câu hỏi bồi của cả bộ — mỗi câu 1 dòng, bot hỏi lần lượt theo thứ tự</div>
+            <AutoTextarea
+              minRows={3}
+              style={cell}
+              placeholder={"Câu 1: Chị cho em xin chiều cao cân nặng để em chọn size và chiều dài vừa nha?\nCâu 2: Chị cao bao nhiêu, nặng bao nhiêu để em chọn đồ vừa ạ?"}
+              value={g.ask || ""}
+              onChange={(e) => setGroup(gi, { ask: e.target.value })}
+            />
+          </div>
+        ))}
+        <button
+          type="button"
+          onClick={() => onChange(list, [...glist, { name: "", members: [], ask: "" }])}
+          style={{ padding: "6px 12px", border: "1px solid #ccc", borderRadius: 6, background: "#fff", cursor: "pointer" }}
+        >
+          + Thêm bộ thuộc tính
+        </button>
+      </div>
+      </Fold>
+    </>
+  );
+}
+
 // Chỉ giữ tên ảnh của những ảnh còn tồn tại
 function cleanForm(form) {
   const keep = new Set([...form.sampleImages, ...form.realImages]);
@@ -250,7 +514,17 @@ function cleanForm(form) {
   }
   const openingExtras = (form.openingExtras || []).map((t) => String(t || "").trim()).filter(Boolean);
   const openingImages = (form.openingImages || []).filter((u) => keep.has(u));
-  return { ...form, imageLabels, openingExtras, openingImages };
+  const attributes = (form.attributes || [])
+    .map((r) => ({ name: String(r?.name || "").trim(), values: String(r?.values || "").trim(), how: String(r?.how || "").trim(), ask: String(r?.ask || "").trim() }))
+    .filter((r) => r.name);
+  const names = new Set(attributes.map((r) => r.name));
+  const attributeGroups = (form.attributeGroups || [])
+    .map((g) => ({ name: String(g?.name || "").trim(), members: (g?.members || []).filter((m) => names.has(m)), ask: String(g?.ask || "").trim() }))
+    .filter((g) => g.members.length >= 2);
+  const priceLadder = (form.priceLadder || [])
+    .map((r) => ({ qty: String(r?.qty || "").trim(), list: String(r?.list || "").trim(), steps: String(r?.steps || "").trim(), floor: String(r?.floor || "").trim() }))
+    .filter((r) => r.qty && r.list);
+  return { ...form, imageLabels, openingExtras, openingImages, attributes, attributeGroups, priceLadder };
 }
 
 export default function AdminPage() {
@@ -265,6 +539,8 @@ export default function AdminPage() {
   const [firstWait, setFirstWait] = useState("12"); // giây chờ trước khi bot trả lời câu đầu tiên của khách mới
   const [firstWaitSaved, setFirstWaitSaved] = useState("12");
   const [firstWaitStatus, setFirstWaitStatus] = useState("");
+  const [offAfterOrder, setOffAfterOrder] = useState(true); // chốt đơn xong (gửi câu giao hàng 3-4 ngày) thì tự tắt bot với khách đó
+  const [offAfterOrderStatus, setOffAfterOrderStatus] = useState("");
   // Hỏi lại thông tin + nhắn bồi khi khách im
   const [askGap, setAskGap] = useState("180"); // giây
   const [nudgeOn, setNudgeOn] = useState(false);
@@ -276,10 +552,13 @@ export default function AdminPage() {
   const [copyParts, setCopyParts] = useState({
     description: true,
     notes: true,
+    attributes: true,
+    priceLadder: true,
     openingScript: true,
     triggerQuestions: false,
     sampleImages: true,
     realImages: true,
+    catalogImages: true,
   });
   const [copyNotice, setCopyNotice] = useState("");
   const [pages, setPages] = useState([]); // danh sách Fanpage
@@ -311,6 +590,7 @@ export default function AdminPage() {
         const w = s.firstContactWaitSec === undefined || s.firstContactWaitSec === null || s.firstContactWaitSec === "" ? "12" : String(s.firstContactWaitSec);
         setFirstWait(w);
         setFirstWaitSaved(w);
+        setOffAfterOrder(s.offAfterOrder !== false);
         // Bản cũ lưu bằng phút (askGapMin) → đổi sang giây
         const g =
           s.askGapSec !== undefined && s.askGapSec !== null && s.askGapSec !== ""
@@ -350,6 +630,23 @@ export default function AdminPage() {
     setTimeout(() => setFirstWaitStatus(""), 2500);
   }
 
+  async function toggleOffAfterOrder(next) {
+    setOffAfterOrder(next);
+    setOffAfterOrderStatus("Đang lưu...");
+    const res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ offAfterOrder: next }),
+    }).catch(() => null);
+    if (res && res.ok) {
+      setOffAfterOrderStatus("Đã lưu ✓");
+    } else {
+      setOffAfterOrder(!next);
+      setOffAfterOrderStatus("Lưu thất bại, thử lại nhé");
+    }
+    setTimeout(() => setOffAfterOrderStatus(""), 2500);
+  }
+
   async function saveAskSettings() {
     const n = Number(askGap);
     if (askGap === "" || !Number.isFinite(n) || n < 0 || n > 14400) {
@@ -360,7 +657,12 @@ export default function AdminPage() {
     const res = await fetch("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ askGapSec: Math.round(n), askGapMin: null, nudgeEnabled: nudgeOn, nudgeText }),
+      body: JSON.stringify({
+        askGapSec: Math.round(n),
+        askGapMin: null,
+        nudgeEnabled: nudgeOn,
+        nudgeText,
+      }),
     });
     if (res.ok) {
       setAskGap(String(Math.round(n)));
@@ -431,11 +733,17 @@ export default function AdminPage() {
       stock: p.stock || "Còn hàng",
       description: p.description || "",
       notes: p.notes || "",
+      modelInfo: p.modelInfo || "",
+      attributes: Array.isArray(p.attributes) ? p.attributes.map((r) => ({ name: r.name || "", values: r.values || "", how: r.how || "", ask: r.ask || "" })) : [],
+      attributeGroups: Array.isArray(p.attributeGroups) ? p.attributeGroups.map((g) => ({ name: g.name || "", members: Array.isArray(g.members) ? [...g.members] : [], ask: g.ask || "" })) : [],
+      priceLadder: Array.isArray(p.priceLadder) ? p.priceLadder.map((r) => ({ qty: String(r.qty ?? ""), list: String(r.list ?? ""), steps: String(r.steps ?? ""), floor: String(r.floor ?? "") })) : [],
+      shipFee: String(p.shipFee ?? ""),
       openingScript: p.openingScript || "",
       openingExtras: Array.isArray(p.openingExtras) ? p.openingExtras : [],
       triggerQuestions: p.triggerQuestions || "",
       sampleImages: p.sampleImages || [],
       realImages: p.realImages || [],
+      catalogImages: p.catalogImages || [],
       // sản phẩm cũ chưa tick lần nào: coi như đang tick hết ảnh mẫu (đúng với cách bot đang gửi)
       openingImages: Array.isArray(p.openingImages) ? p.openingImages : p.sampleImages || [],
       imageLabels: p.imageLabels || {},
@@ -451,9 +759,16 @@ export default function AdminPage() {
       for (const key of ["description", "notes", "openingScript", "triggerQuestions"]) {
         if (parts[key]) next[key] = src[key] || "";
       }
+      if (parts.notes) next.modelInfo = src.modelInfo || "";
+      if (parts.attributes) {
+        next.attributes = Array.isArray(src.attributes) ? src.attributes.map((r) => ({ ...r })) : [];
+        next.attributeGroups = Array.isArray(src.attributeGroups) ? src.attributeGroups.map((g) => ({ ...g, members: [...(g.members || [])] })) : [];
+      }
+      if (parts.priceLadder) next.priceLadder = Array.isArray(src.priceLadder) ? src.priceLadder.map((r) => ({ ...r })) : [];
       if (parts.openingScript) next.openingExtras = Array.isArray(src.openingExtras) ? [...src.openingExtras] : [];
-      for (const key of ["sampleImages", "realImages"]) {
+      for (const key of ["sampleImages", "realImages", "catalogImages"]) {
         if (parts[key]) {
+          next[key] = next[key] || [];
           const add = (src[key] || []).filter((u) => !next[key].includes(u));
           next[key] = [...next[key], ...add];
           for (const u of add) if (src.imageLabels?.[u]) next.imageLabels[u] = src.imageLabels[u];
@@ -483,11 +798,17 @@ export default function AdminPage() {
       stock: p.stock || "Còn hàng",
       description: p.description || "",
       notes: p.notes || "",
+      modelInfo: p.modelInfo || "",
+      attributes: Array.isArray(p.attributes) ? p.attributes.map((r) => ({ name: r.name || "", values: r.values || "", how: r.how || "", ask: r.ask || "" })) : [],
+      attributeGroups: Array.isArray(p.attributeGroups) ? p.attributeGroups.map((g) => ({ name: g.name || "", members: Array.isArray(g.members) ? [...g.members] : [], ask: g.ask || "" })) : [],
+      priceLadder: Array.isArray(p.priceLadder) ? p.priceLadder.map((r) => ({ qty: String(r.qty ?? ""), list: String(r.list ?? ""), steps: String(r.steps ?? ""), floor: String(r.floor ?? "") })) : [],
+      shipFee: String(p.shipFee ?? ""),
       openingScript: p.openingScript || "",
       openingExtras: Array.isArray(p.openingExtras) ? p.openingExtras : [],
       triggerQuestions: "", // để trống: nếu trùng câu hỏi quảng cáo, bot sẽ nhầm sang sản phẩm cũ
       sampleImages: p.sampleImages || [],
       realImages: p.realImages || [],
+      catalogImages: p.catalogImages || [],
       // sản phẩm cũ chưa tick lần nào: coi như đang tick hết ảnh mẫu (đúng với cách bot đang gửi)
       openingImages: Array.isArray(p.openingImages) ? p.openingImages : p.sampleImages || [],
       imageLabels: p.imageLabels || {},
@@ -583,6 +904,16 @@ export default function AdminPage() {
           </div>
         </div>
         <div style={{ margin: "12px 0", padding: "10px 12px", background: "#fff", border: "1px solid #e2e2e2", borderRadius: 8 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flexWrap: "wrap" }}>
+            <input type="checkbox" checked={offAfterOrder} onChange={(e) => toggleOffAfterOrder(e.target.checked)} />
+            <strong style={{ fontSize: 14 }}>Chốt đơn xong thì tự tắt bot với khách đó</strong>
+            <span style={{ color: "#2d7a3a", fontSize: 13 }}>{offAfterOrderStatus}</span>
+          </label>
+          <div style={{ color: "#666", fontSize: 12, marginTop: 6 }}>
+            Khi bot gửi xong câu "Đơn hàng giao trong khoảng 3-4 ngày chị để ý điện thoại giúp em nha", bot sẽ không trả lời khách đó nữa (cũng không nhắn bồi). Muốn bot trả lời lại thì bật nút gạt cạnh tên khách trong khung chat. Cần ghi thời gian giao hàng (vd "Giao hàng 3-4 ngày") trong ô thông tin shop để bot có câu này.
+          </div>
+        </div>
+        <div style={{ margin: "12px 0", padding: "10px 12px", background: "#fff", border: "1px solid #e2e2e2", borderRadius: 8 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <strong style={{ fontSize: 14 }}>Thời gian hỏi lại thông tin:</strong>
             <input
@@ -598,14 +929,14 @@ export default function AdminPage() {
           </div>
           <div style={{ color: "#666", fontSize: 12, margin: "6px 0 10px" }}>
             Bot vẫn trả lời khách bình thường. Lần đầu bot hỏi xin thông tin (màu, size, SĐT, địa chỉ...) thì hỏi luôn, không chờ.
-            Sau đó, khách hỏi chuyện khác thì bot chỉ trả lời, chưa hỏi lại; đủ số giây này mới được hỏi lại, và câu hỏi lại sẽ ngắn hơn, đổi cách nói so với câu cũ (60 giây = 1 phút, 180 = 3 phút). Nhập 0 = dùng luật cũ (không hỏi lại trong 3 tin gần nhất).
+            Sau đó, khách hỏi chuyện khác thì bot chỉ trả lời, không hỏi lại; việc hỏi lại do tin nhắn bồi lo, sau đúng số giây này kể từ tin cuối của bot, và câu hỏi lại sẽ ngắn hơn, đổi cách nói so với câu cũ (60 giây = 1 phút, 180 = 3 phút). Khi khách đã có đủ màu và size, bot xin luôn SĐT và địa chỉ rồi chốt đơn. Nhập 0 = dùng luật cũ (không hỏi lại trong 3 tin gần nhất).
           </div>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, cursor: "pointer" }}>
             <input type="checkbox" checked={nudgeOn} onChange={(e) => setNudgeOn(e.target.checked)} />
             Khách im quá số giây trên → bot nhắn thêm 1 câu ngắn: nếu bot đang hỏi xin thông tin (size, màu...) mà khách chưa trả lời thì hỏi lại gọn hơn, đổi cách nói (vd “Chị cho em xin chiều cao cân nặng nha?”); không còn gì thiếu thì nhắn câu chốt đơn, vd “Em lên đơn váy vàng nhé chị?” (sớm nhất sau khoảng 30–60 giây; lỡ quá giờ thì bỏ, không nhắn trễ)
           </label>
           <div style={{ color: "#666", fontSize: 12, margin: "6px 0" }}>
-            Chỉ nhắn khách chưa để lại SĐT, chưa có đơn, chủ shop chưa nhắn tay. Mỗi lần khách nhắn chỉ 1 câu. Câu chốt (chỉ dùng khi không còn thông tin nào cần hỏi lại; mỗi dòng 1 câu, bot chọn ngẫu nhiên; dùng {"{sp}"} = tên sản phẩm, {"{mau}"} = màu/size khách đã chọn; để trống = AI tự soạn theo cuộc chat):
+            Chỉ nhắn khách chưa có đơn thật (đơn nháp tự tạo khi khách để lại SĐT thì vẫn nhắn nếu còn thiếu thông tin như địa chỉ), chủ shop chưa nhắn tay. Nếu tin cuối của bot là câu hỏi (kết thúc bằng dấu ?) thì bot không bồi. Mỗi lần khách nhắn bot chỉ bồi 1 lần, khách vẫn im thì bot dừng hẳn. Câu chốt (chỉ dùng khi không còn thông tin nào cần hỏi lại; mỗi dòng 1 câu, bot chọn ngẫu nhiên; dùng {"{sp}"} = tên sản phẩm, {"{mau}"} = màu/size khách đã chọn; để trống = AI tự soạn theo cuộc chat):
           </div>
           <textarea
             style={{ ...inputStyle, width: "100%", boxSizing: "border-box", resize: "vertical" }}
@@ -718,10 +1049,13 @@ export default function AdminPage() {
               {[
                 ["description", "Nội dung"],
                 ["notes", "Lưu ý cho bot"],
+                ["attributes", "Bảng thuộc tính"],
+                ["priceLadder", "Bảng giá mặc cả"],
                 ["openingScript", "Câu mở đầu"],
                 ["triggerQuestions", "Câu hỏi có sẵn"],
                 ["sampleImages", "Ảnh mẫu"],
                 ["realImages", "Ảnh thực tế"],
+                ["catalogImages", "Ảnh tổng hợp mẫu mã"],
               ].map(([key, label]) => (
                 <label key={key} style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
                   <input
@@ -740,15 +1074,32 @@ export default function AdminPage() {
             )}
           </div>
         )}
-        <div>
-          <label style={{ display: "block", fontWeight: 600, fontSize: 14, marginBottom: 2 }}>
-            Áp dụng cho Page
-          </label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            onClick={(e) => e.currentTarget.closest("form").querySelectorAll("details[data-fold]").forEach((d) => (d.open = true))}
+            style={{ ...btn, fontSize: 13 }}
+          >
+            Mở hết
+          </button>
+          <button
+            type="button"
+            onClick={(e) => e.currentTarget.closest("form").querySelectorAll("details[data-fold]").forEach((d) => (d.open = false))}
+            style={{ ...btn, fontSize: 13 }}
+          >
+            Thu gọn hết
+          </button>
+        </div>
+        <Fold
+          title="Áp dụng cho Page"
+          note={form.pageIds.length ? `${form.pageIds.length} Page` : "Tất cả Page"}
+          filled={form.pageIds.length > 0}
+        >
           <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
             Tick các Page muốn bán và tư vấn sản phẩm này (chọn được nhiều Page). Không tick Page nào (hoặc tick “Tất cả Page”) nếu sản phẩm dùng chung.
           </div>
           <PageChecklist pages={pages} value={form.pageIds} onChange={(ids) => setForm({ ...form, pageIds: ids })} />
-        </div>
+        </Fold>
         <input
           style={inputStyle}
           placeholder="Tên sản phẩm (vd: Chân váy 3 tầng)"
@@ -762,28 +1113,45 @@ export default function AdminPage() {
           value={form.stock}
           onChange={(e) => setForm({ ...form, stock: e.target.value })}
         />
-        <textarea
-          style={{ ...inputStyle, width: "100%", boxSizing: "border-box", resize: "vertical", flexShrink: 0, minHeight: 220 }}
-          placeholder="Nội dung sản phẩm: giá bán (theo số lượng nếu có), chất liệu, màu sắc, size, ưu đãi, giao hàng, câu hỏi khách hay hỏi..."
-          value={form.description}
-          onChange={(e) => setForm({ ...form, description: e.target.value })}
-          rows={10}
-        />
-        {/\|/.test(form.description) && (
-          <button
-            type="button"
-            onClick={() =>
-              setForm((f) => ({ ...f, description: f.description.replace(/[ \t]*(\|[ \t]*)+$/gm, "") }))
-            }
-            style={{ ...btn, alignSelf: "flex-start", fontSize: 13 }}
-          >
-            Dọn ký tự "|" thừa ở cuối dòng
-          </button>
-        )}
-        <div>
-          <label style={{ display: "block", fontWeight: 600, fontSize: 14, marginBottom: 2 }}>
-            Lưu ý cho bot (không bắt buộc)
-          </label>
+        <Fold
+          title="Nội dung sản phẩm"
+          note={has(form.description) ? `${String(form.description).length} ký tự` : "chưa có"}
+          filled={has(form.description)}
+        >
+          <textarea
+            style={{ ...inputStyle, width: "100%", boxSizing: "border-box", resize: "vertical", flexShrink: 0, minHeight: 220 }}
+            placeholder="Nội dung sản phẩm: giá bán (theo số lượng nếu có), chất liệu, màu sắc, size, ưu đãi, giao hàng, câu hỏi khách hay hỏi..."
+            value={form.description}
+            onChange={(e) => setForm({ ...form, description: e.target.value })}
+            rows={10}
+          />
+          {/\|/.test(form.description) && (
+            <button
+              type="button"
+              onClick={() =>
+                setForm((f) => ({ ...f, description: f.description.replace(/[ \t]*(\|[ \t]*)+$/gm, "") }))
+              }
+              style={{ ...btn, marginTop: 8, fontSize: 13 }}
+            >
+              Dọn ký tự "|" thừa ở cuối dòng
+            </button>
+          )}
+        </Fold>
+        <AttributeTable rows={form.attributes} groups={form.attributeGroups} onChange={(rows, groups) => setForm({ ...form, attributes: rows, attributeGroups: groups })} />
+        <PriceLadderTable rows={form.priceLadder} onChange={(rows) => setForm({ ...form, priceLadder: rows })} />
+        <Fold title="Phí ship (không bắt buộc)" note={has(form.shipFee) ? form.shipFee : "chưa có"} filled={has(form.shipFee)}>
+          <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
+            Phí ship cho 1 đơn. Có số này thì tin tóm tắt đơn ghi "Tổng tiền: giá + ship (gồm ship)". Để trống nếu freeship
+            (ghi "freeship" trong nội dung sản phẩm) hoặc chưa tính phí ship.
+          </div>
+          <input
+            style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+            value={form.shipFee}
+            onChange={(e) => setForm({ ...form, shipFee: e.target.value })}
+            placeholder="Ví dụ: 30000 hoặc 30k"
+          />
+        </Fold>
+        <Fold title="Lưu ý cho bot (không bắt buộc)" note={has(form.notes) ? "đã nhập" : "chưa có"} filled={has(form.notes)}>
           <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
             Dặn riêng bot về sản phẩm này: đối tượng khách, cách xưng hô, điều nên/không nên nói... Bot sẽ tuân theo khi
             tư vấn sản phẩm này.
@@ -795,11 +1163,28 @@ export default function AdminPage() {
             onChange={(e) => setForm({ ...form, notes: e.target.value })}
             placeholder={"Ví dụ:\nKhách của sản phẩm này toàn là nữ, gọi khách là chị.\nKhông tự giảm giá, chỉ báo giá theo bảng."}
           />
-        </div>
-        <div>
-          <label style={{ display: "block", fontWeight: 600, fontSize: 14, marginBottom: 2 }}>
-            Câu thoại mở đầu (chạy quảng cáo)
-          </label>
+        </Fold>
+        <Fold
+          title="Thông tin bạn mẫu trong ảnh thực tế (không bắt buộc)"
+          note={has(form.modelInfo) ? "đã nhập" : "chưa có"}
+          filled={has(form.modelInfo)}
+        >
+          <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
+            Mỗi ảnh chỉ gửi cho khách 1 lần. Khách xin xem lại ảnh đã gửi thì bot không gửi lại mà nói câu này:
+            "Dạ bạn mẫu trong ảnh bên em ... ạ". Bạn chỉ cần ghi phần thông tin.
+          </div>
+          <input
+            style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+            value={form.modelInfo || ""}
+            onChange={(e) => setForm({ ...form, modelInfo: e.target.value })}
+            placeholder="Ví dụ: cao 1m45, nặng 40kg, mặc size S, váy dài 75cm"
+          />
+        </Fold>
+        <Fold
+          title="Câu thoại mở đầu (chạy quảng cáo)"
+          note={has(form.openingScript) ? "đã nhập" : "chưa có"}
+          filled={has(form.openingScript)}
+        >
           <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
             Khi khách nhắn lần đầu kiểu "Giá sản phẩm bao nhiêu?", bot gửi đúng câu này kèm ảnh mẫu của sản phẩm
             (ảnh thực tế chỉ gửi khi khách hỏi). Để trống nếu không dùng.
@@ -841,11 +1226,12 @@ export default function AdminPage() {
           >
             + Thêm tin nhắn
           </button>
-        </div>
-        <div>
-          <label style={{ display: "block", fontWeight: 600, fontSize: 14, marginBottom: 2 }}>
-            Câu hỏi có sẵn của quảng cáo (không bắt buộc)
-          </label>
+        </Fold>
+        <Fold
+          title="Câu hỏi có sẵn của quảng cáo (không bắt buộc)"
+          note={has(form.triggerQuestions) ? "đã nhập" : "chưa có"}
+          filled={has(form.triggerQuestions)}
+        >
           <div style={{ color: "#888", fontSize: 12, marginBottom: 6 }}>
             Mỗi dòng 1 câu, gõ giống hệt câu hỏi sẵn bạn cài ở quảng cáo. Khách bấm câu nào, bot biết ngay khách đang
             hỏi sản phẩm này và gửi câu mở đầu. Nếu câu hỏi đã có sẵn tên sản phẩm ở trên thì có thể bỏ trống.
@@ -857,27 +1243,54 @@ export default function AdminPage() {
             onChange={(e) => setForm({ ...form, triggerQuestions: e.target.value })}
             placeholder={"Ví dụ:\nGiá chân váy 3 tầng bao nhiêu?\nTư vấn giúp mình chân váy 3 tầng"}
           />
-        </div>
-        <ImagePicker
-          title="Ảnh sản phẩm mẫu"
-          hint="Ảnh giới thiệu, ảnh đẹp. Đặt tên từng ảnh (vd: Váy trắng) để bot gửi đúng mẫu khi khách hỏi"
-          urls={form.sampleImages}
-          labels={form.imageLabels}
-          onLabel={setLabel}
-          onChange={(urls) => setForm((f) => ({ ...f, sampleImages: urls }))}
-          ticked={form.openingImages}
-          onToggle={toggleOpening}
-        />
-        <ImagePicker
+        </Fold>
+        <Fold
+          title="Ảnh giới thiệu / ảnh các màu"
+          note={(form.sampleImages || []).length ? `${form.sampleImages.length} ảnh` : "chưa có"}
+          filled={(form.sampleImages || []).length > 0}
+        >
+          <ImagePicker
+            bare
+            title="Ảnh giới thiệu / ảnh các màu"
+            hint="Ảnh giới thiệu, ảnh đẹp, ảnh từng màu (KHÔNG phải ảnh người mẫu mặc). Đặt tên từng ảnh (vd: Váy trắng) để bot gửi đúng mẫu khi khách hỏi"
+            urls={form.sampleImages}
+            labels={form.imageLabels}
+            onLabel={setLabel}
+            onChange={(urls) => setForm((f) => ({ ...f, sampleImages: urls }))}
+            ticked={form.openingImages}
+            onToggle={toggleOpening}
+          />
+        </Fold>
+        <Fold
           title="Ảnh sản phẩm thực tế"
-          hint="Ảnh chụp hàng thật, khách hàng thật, feedback"
-          urls={form.realImages}
-          labels={form.imageLabels}
-          onLabel={setLabel}
-          onChange={(urls) => setForm((f) => ({ ...f, realImages: urls }))}
-          ticked={form.openingImages}
-          onToggle={toggleOpening}
-        />
+          note={(form.realImages || []).length ? `${form.realImages.length} ảnh` : "chưa có"}
+          filled={(form.realImages || []).length > 0}
+        >
+          <ImagePicker
+            bare
+            title="Ảnh sản phẩm thực tế"
+            hint="Ảnh chụp hàng thật, người mẫu mặc, khách hàng thật, feedback. Khách xin “ảnh mẫu” (người mẫu mặc) thì bot chỉ gửi mục này"
+            urls={form.realImages}
+            labels={form.imageLabels}
+            onLabel={setLabel}
+            onChange={(urls) => setForm((f) => ({ ...f, realImages: urls }))}
+            ticked={form.openingImages}
+            onToggle={toggleOpening}
+          />
+        </Fold>
+        <Fold
+          title="Ảnh TỔNG HỢP tất cả mẫu mã / màu"
+          note={(form.catalogImages || []).length ? `${form.catalogImages.length} ảnh` : "chưa có"}
+          filled={(form.catalogImages || []).length > 0}
+        >
+          <ImagePicker
+            bare
+            title="Ảnh TỔNG HỢP tất cả mẫu mã / màu"
+            hint="Khách hỏi chung kiểu “có mấy màu”, “có mẫu nào”, “xin màu” thì bot tự gửi ảnh này (nên làm 1 ảnh gom tất cả màu/mẫu). Không cần đặt tên ảnh."
+            urls={form.catalogImages || []}
+            onChange={(urls) => setForm((f) => ({ ...f, catalogImages: urls }))}
+          />
+        </Fold>
         <div style={{ display: "flex", gap: 8 }}>
           <button
             type="submit"
@@ -977,6 +1390,33 @@ export default function AdminPage() {
                     >
                       {p.description || "(chưa có nội dung)"}
                     </p>
+                    {Array.isArray(p.attributes) && p.attributes.length > 0 && (
+                      <div style={{ margin: "10px 0", padding: "8px 10px", background: "#eef4ff", borderRadius: 6, fontSize: 13 }}>
+                        <div style={{ color: "#456", fontSize: 12, marginBottom: 2 }}>Bảng thuộc tính</div>
+                        {p.attributes.map((r, i) => (
+                          <div key={i}>
+                            <b>{r.name}</b>
+                            {r.values ? `: ${r.values}` : ""}
+                            {r.how ? ` — ${r.how}` : ""}
+                            {r.ask ? ` — hỏi: “${String(r.ask).split("\n")[0]}”` : ""}
+                          </div>
+                        ))}
+                        {Array.isArray(p.attributeGroups) && p.attributeGroups.map((g, i) => (
+                          <div key={"g" + i} style={{ marginTop: 4, color: "#345" }}>
+                            <b>Bộ{g.name ? ` “${g.name}”` : ""}</b>: {(g.members || []).join(" + ")}
+                            {g.ask ? ` — hỏi: “${String(g.ask).split("\n")[0]}”` : ""}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {Array.isArray(p.priceLadder) && ladderRows(p).length > 0 && (
+                      <div style={{ margin: "10px 0", padding: "8px 10px", background: "#f1faf1", borderRadius: 6, fontSize: 13 }}>
+                        <div style={{ color: "#575", fontSize: 12, marginBottom: 2 }}>Bảng giá mặc cả</div>
+                        {ladderPreview(ladderRows(p)).map((t, i) => (
+                          <div key={i}>{t}</div>
+                        ))}
+                      </div>
+                    )}
                     {p.notes && (
                       <div style={{ margin: "10px 0", padding: "8px 10px", background: "#f1faf1", borderRadius: 6, fontSize: 13, whiteSpace: "pre-wrap" }}>
                         <div style={{ color: "#575", fontSize: 12, marginBottom: 2 }}>Lưu ý cho bot</div>
@@ -1002,6 +1442,7 @@ export default function AdminPage() {
                     )}
                     <Thumbs label="Ảnh mẫu" urls={p.sampleImages} labels={p.imageLabels} />
                     <Thumbs label="Ảnh thực tế" urls={p.realImages} labels={p.imageLabels} />
+                    <Thumbs label="Ảnh tổng hợp mẫu mã" urls={p.catalogImages} labels={{}} />
                     {isOwner && pages.length > 0 && (
                       <div style={{ marginTop: 12 }}>
                         <div style={{ fontSize: 13, color: "#666", marginBottom: 6 }}>Áp dụng cho Page (tick để bật/tắt ngay):</div>

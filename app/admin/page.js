@@ -1,6 +1,6 @@
 "use client";
-import { useEffect, useRef, useState, useCallback } from "react";
-import { BoxIcon, KeyIcon, SettingsIcon, UsersIcon, navButtonStyle } from "./icons";
+import { Fragment, useEffect, useRef, useState, useCallback } from "react";
+import { BoxIcon, KeyIcon, ReceiptIcon, SettingsIcon, UsersIcon, navButtonStyle } from "./icons";
 import MembersModal from "./MembersModal";
 import TeachChat from "./TeachChat";
 
@@ -471,18 +471,51 @@ function SettingsModal({ pages, onClose, onChanged }) {
   );
 }
 
-// Hộp thoại API key AI (Gemini): thêm nhiều key, bot tự xoay vòng khi 1 key hết hạn mức
-function ApiKeysModal({ onClose }) {
+// Một nhóm key của 1 nhà cung cấp AI (provider = "gemini" | "claude" | "groq"): thêm nhiều key, bot tự xoay vòng khi 1 key hết hạn mức
+function KeySection({ provider, title, subtitle, placeholder, help }) {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
   const [keyValue, setKeyValue] = useState("");
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [status, setStatus] = useState({}); // { [keyId]: kết quả kiểm tra | { checking: true } }
+
+  async function handleCheck(id) {
+    const ids = id ? [id] : keys.map((k) => k.id);
+    if (!ids.length) return;
+    setStatus((st) => ({ ...st, ...Object.fromEntries(ids.map((i) => [i, { checking: true }])) }));
+    try {
+      const res = await fetch("/api/keys/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(id ? { id, provider } : { provider }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Không kiểm tra được");
+      setStatus((st) => {
+        const next = { ...st };
+        for (const r of data.results || []) next[r.id] = r;
+        return next;
+      });
+    } catch (e) {
+      setStatus((st) => ({
+        ...st,
+        ...Object.fromEntries(ids.map((i) => [i, { status: "error", message: e.message }])),
+      }));
+    }
+  }
+
+  const STATUS_UI = {
+    ok: { color: "#15803d", bg: "#f0fdf4", text: "✅ Còn hạn mức" },
+    quota: { color: "#b45309", bg: "#fffbeb", text: "⚠️ Hết hạn mức" },
+    invalid: { color: "#c0392b", bg: "#fff5f5", text: "❌ Key sai/bị khóa" },
+    error: { color: "#6b7280", bg: "#f3f4f6", text: "❔ Không xác định" },
+  };
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/keys", { cache: "no-store" });
+      const res = await fetch(`/api/keys?provider=${provider}`, { cache: "no-store" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) setError(data.error || "Không tải được danh sách key");
       else setKeys(data.keys || []);
@@ -490,7 +523,7 @@ function ApiKeysModal({ onClose }) {
       setError("Lỗi mạng, thử lại nhé.");
     }
     setLoading(false);
-  }, []);
+  }, [provider]);
 
   useEffect(() => {
     load();
@@ -505,7 +538,7 @@ function ApiKeysModal({ onClose }) {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: keyValue, label }),
+        body: JSON.stringify({ key: keyValue, label, provider }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) setError(data.error || "Không thêm được key");
@@ -526,7 +559,7 @@ function ApiKeysModal({ onClose }) {
     const res = await fetch("/api/keys", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: k.id }),
+      body: JSON.stringify({ id: k.id, provider }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) setError(data.error || "Không xóa được key");
@@ -534,43 +567,23 @@ function ApiKeysModal({ onClose }) {
   }
 
   return (
-    <div
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.4)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 50,
-        padding: 16,
-      }}
-    >
-      <div
-        style={{
-          background: "#fff",
-          borderRadius: 14,
-          width: "100%",
-          maxWidth: 520,
-          maxHeight: "90vh",
-          overflowY: "auto",
-          padding: 22,
-          boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-          <strong style={{ fontSize: 18 }}>API key AI (Gemini)</strong>
-          <button
-            onClick={onClose}
-            aria-label="Đóng"
-            style={{ border: "none", background: "transparent", fontSize: 22, cursor: "pointer", color: "#666" }}
-          >
-            ×
-          </button>
+    <div style={{ marginBottom: 26 }}>
+      <div style={{ marginBottom: 10 }}>
+        <strong style={{ fontSize: 16 }}>{title}</strong>
+        {subtitle && <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>{subtitle}</div>}
+      </div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontSize: 13, color: "#666" }}>Các key đang dùng ({keys.length})</div>
+          {keys.length > 0 && (
+            <button
+              onClick={() => handleCheck()}
+              disabled={Object.values(status).some((v) => v.checking)}
+              style={{ padding: "5px 12px", borderRadius: 8, border: "1px solid #ddd", background: "#fff", cursor: "pointer", fontSize: 13 }}
+            >
+              Kiểm tra tất cả
+            </button>
+          )}
         </div>
-
-        <div style={{ fontSize: 13, color: "#666", marginBottom: 8 }}>Các key đang dùng ({keys.length})</div>
         <div style={{ border: "1px solid #eee", borderRadius: 10, marginBottom: 20 }}>
           {loading && <div style={{ padding: 14, color: "#888", fontSize: 14 }}>Đang tải...</div>}
           {!loading && keys.length === 0 && (
@@ -584,7 +597,41 @@ function ApiKeysModal({ onClose }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 600, fontSize: 14, fontFamily: "monospace" }}>{k.masked}</div>
                 {k.label && <div style={{ fontSize: 11, color: "#999" }}>{k.label}</div>}
+                {status[k.id] && (
+                  <div style={{ marginTop: 4 }}>
+                    {status[k.id].checking ? (
+                      <span style={{ fontSize: 12, color: "#888" }}>Đang kiểm tra...</span>
+                    ) : (
+                      <>
+                        <span
+                          style={{
+                            fontSize: 12,
+                            padding: "2px 8px",
+                            borderRadius: 999,
+                            fontWeight: 600,
+                            color: (STATUS_UI[status[k.id].status] || STATUS_UI.error).color,
+                            background: (STATUS_UI[status[k.id].status] || STATUS_UI.error).bg,
+                          }}
+                        >
+                          {(STATUS_UI[status[k.id].status] || STATUS_UI.error).text}
+                        </span>
+                        <div style={{ fontSize: 11, color: "#999", marginTop: 3 }}>
+                          {status[k.id].message}
+                          {status[k.id].retryAfterSec ? ` · thử lại sau ~${status[k.id].retryAfterSec}s` : ""}
+                          {status[k.id].ms ? ` · ${status[k.id].ms}ms` : ""}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
+              <button
+                onClick={() => handleCheck(k.id)}
+                disabled={!!status[k.id]?.checking}
+                style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid #ddd", background: "#fff", cursor: "pointer", fontSize: 13 }}
+              >
+                Kiểm tra
+              </button>
               {k.removable && (
                 <button
                   onClick={() => handleRemove(k)}
@@ -612,7 +659,7 @@ function ApiKeysModal({ onClose }) {
             autoComplete="off"
             value={keyValue}
             onChange={(e) => setKeyValue(e.target.value)}
-            placeholder="AIza..."
+            placeholder={placeholder}
             style={{ width: "100%", boxSizing: "border-box", padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", marginBottom: 8 }}
           />
           <div style={{ display: "flex", gap: 8 }}>
@@ -638,11 +685,79 @@ function ApiKeysModal({ onClose }) {
               {busy ? "Đang lưu..." : "Thêm"}
             </button>
           </div>
-          <p style={{ fontSize: 12, color: "#888", margin: "8px 0 0" }}>
-            Lấy key miễn phí tại Google AI Studio. Có nhiều key thì bot tự chuyển sang key khác khi 1 key hết hạn mức.
-          </p>
+          <p style={{ fontSize: 12, color: "#888", margin: "8px 0 0" }}>{help}</p>
           {error && <p style={{ fontSize: 13, color: "#c0392b", margin: "10px 0 0" }}>{error}</p>}
         </form>
+    </div>
+  );
+}
+
+// Hộp thoại API key AI: Gemini (chính) → Claude (dự phòng trả phí) → Groq (dự phòng cuối)
+function ApiKeysModal({ onClose }) {
+  return (
+    <div
+      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.4)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 50,
+        padding: 16,
+      }}
+    >
+      <div
+        style={{
+          background: "#fff",
+          borderRadius: 14,
+          width: "100%",
+          maxWidth: 520,
+          maxHeight: "90vh",
+          overflowY: "auto",
+          padding: 22,
+          boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <strong style={{ fontSize: 18 }}>API key AI</strong>
+          <button
+            onClick={onClose}
+            aria-label="Đóng"
+            style={{ border: "none", background: "transparent", fontSize: 22, cursor: "pointer", color: "#666" }}
+          >
+            ×
+          </button>
+        </div>
+
+        <KeySection
+          provider="gemini"
+          title="Gemini (chính)"
+          subtitle="Bot luôn thử Gemini trước."
+          placeholder="AIza..."
+          help="Lấy key miễn phí tại Google AI Studio. Có nhiều key thì bot tự chuyển sang key khác khi 1 key hết hạn mức."
+        />
+
+        <div style={{ borderTop: "1px solid #eee", margin: "0 0 20px" }} />
+
+        <KeySection
+          provider="claude"
+          title="Claude (dự phòng 1 — trả phí)"
+          subtitle="Chỉ dùng khi tất cả key Gemini lỗi hoặc hết hạn mức. Thử trước Groq."
+          placeholder="sk-ant-..."
+          help="Lấy key tại console.anthropic.com/settings/keys (bắt đầu bằng sk-ant-) và nạp tiền ở Plans & Billing. Chỉ tốn tiền khi Gemini hỏng. Nên đặt hạn mức chi tiêu hàng tháng bên Anthropic để yên tâm."
+        />
+
+        <div style={{ borderTop: "1px solid #eee", margin: "0 0 20px" }} />
+
+        <KeySection
+          provider="groq"
+          title="Groq (dự phòng 2 — miễn phí)"
+          subtitle="Chỉ dùng khi cả Gemini lẫn Claude đều lỗi."
+          placeholder="gsk_..."
+          help="Lấy key miễn phí tại console.groq.com/keys (bắt đầu bằng gsk_). Thêm xong là bot dùng được ngay, không cần deploy lại."
+        />
       </div>
     </div>
   );
@@ -655,9 +770,11 @@ const ORDER_STATUS = {
   draft: { label: "Mới tạo", color: "#6b7280" },
   shipped: { label: "Đã gửi hàng", color: "#2563eb" },
   delivered: { label: "Đã giao", color: "#16a34a" },
-  returned: { label: "Hoàn / Hủy", color: "#dc2626" },
+  returned: { label: "Đã hủy", color: "#dc2626" },
 };
 const statusOf = (o) => (ORDER_STATUS[o?.status] ? o.status : "draft");
+// Tổng thu của 1 đơn (đơn cũ chưa lưu "total" thì tính lại: đơn giá × số lượng + ship)
+const orderTotal = (o) => (Number(o?.total) > 0 ? Number(o.total) : (Number(o?.unitPrice) || 0) * (Number(o?.quantity) || 1) + (Number(o?.shipFee) || 0));
 const filterFieldStyle = { height: 34, padding: "0 10px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff", fontSize: 13, color: "#111827", width: "100%", boxSizing: "border-box", outline: "none" };
 const filterLabelStyle = { fontSize: 11, fontWeight: 600, letterSpacing: 0.4, color: "#6b7280", textTransform: "uppercase", marginBottom: 5 };
 const filterChipStyle = (active) => ({
@@ -687,6 +804,33 @@ const blankOrder = { customerName: "", phone: "", address: "", productId: "", pr
 
 // Cột đơn hàng bên phải: luôn hiện khi đang mở 1 hội thoại.
 // Trên cùng là nút "Tạo đơn"; bên dưới là các đơn đã lưu, mỗi đơn có nút bút để sửa.
+// Ô nhập tiền khách trả lại khi hủy đơn (khách không nhận hàng nhưng gửi lại 1 ít tiền) → tính vào lãi
+function RefundInput({ order, onSaved }) {
+  const fmt = (n) => (Number(n) ? Number(n).toLocaleString("vi-VN") : "");
+  const [v, setV] = useState(fmt(order.refund));
+  useEffect(() => setV(fmt(order.refund)), [order.refund]);
+  async function commit() {
+    const n = Number(String(v).replace(/[^\d]/g, "")) || 0;
+    setV(fmt(n));
+    if (n === (Number(order.refund) || 0)) return;
+    try {
+      await fetch("/api/orders", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: order.id, refund: n }) });
+    } catch {}
+    onSaved && onSaved();
+  }
+  return (
+    <input
+      inputMode="numeric"
+      value={v}
+      placeholder="Tiền khách trả lại (đ)"
+      onChange={(e) => setV(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+      style={{ flex: 1, minWidth: 140, padding: "4px 8px", border: "1px solid #fca5a5", borderRadius: 6, fontSize: 13, background: "#fff7f7" }}
+    />
+  );
+}
+
 function OrderPanel({ conversationId, pageId, onChanged }) {
   const [order, setOrder] = useState(blankOrder);
   const [products, setProducts] = useState([]);
@@ -696,6 +840,49 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
   const [aiOk, setAiOk] = useState(false);
+  const [warnings, setWarnings] = useState([]); // cảnh báo khi điền đơn từ chat (chiều dài lạ, số lượng chưa rõ...)
+
+  // Ghi chú riêng về khách này (tự lưu sau khi ngừng gõ ~1 giây)
+  const [note, setNote] = useState("");
+  const [noteState, setNoteState] = useState(""); // "", "saving", "saved", "error"
+  const noteLoaded = useRef(false);
+  const noteTimer = useRef(null);
+  useEffect(() => {
+    let alive = true;
+    noteLoaded.current = false;
+    fetch(`/api/conversations/${encodeURIComponent(conversationId)}/note`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : { note: "" }))
+      .then((d) => { if (alive) { setNote(d.note || ""); noteLoaded.current = true; } })
+      .catch(() => { noteLoaded.current = true; });
+    return () => { alive = false; clearTimeout(noteTimer.current); };
+  }, [conversationId]);
+
+  async function saveNote(text) {
+    if (!noteLoaded.current) return;
+    setNoteState("saving");
+    try {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/note`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: text }),
+      });
+      setNoteState(res.ok ? "saved" : "error");
+    } catch {
+      setNoteState("error");
+    }
+  }
+
+  function onNoteChange(text) {
+    setNote(text);
+    setNoteState("");
+    clearTimeout(noteTimer.current);
+    noteTimer.current = setTimeout(() => saveNote(text), 1000);
+  }
+
+  function onNoteBlur() {
+    clearTimeout(noteTimer.current);
+    if (noteState === "") saveNote(note);
+  }
 
   const loadSaved = useCallback(async () => {
     try {
@@ -737,6 +924,7 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
       setOrder(data.order);
       setProducts(data.products || []);
       setAiOk(!!data.aiOk);
+      setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
       setOrderId(null);
     } catch (e) {
       setAiOk(false);
@@ -762,6 +950,7 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
     setOrder({ ...blankOrder, ...o });
     setOrderId(o.id);
     setAiOk(false);
+    setWarnings(Array.isArray(o.review) ? o.review : []);
     setLoading(false);
     setMsg("");
     setFormOpen(true);
@@ -865,6 +1054,24 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
         >
           🧾 Tạo đơn
         </button>
+
+        {/* Ô ghi chú riêng về khách này */}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: "#444" }}>📝 Ghi chú về khách này</span>
+            <span style={{ fontSize: 11.5, color: noteState === "error" ? "#dc2626" : "#16a34a" }}>
+              {noteState === "saving" ? "Đang lưu..." : noteState === "saved" ? "Đã lưu ✓" : noteState === "error" ? "Lưu lỗi, thử lại" : ""}
+            </span>
+          </div>
+          <textarea
+            value={note}
+            onChange={(e) => onNoteChange(e.target.value)}
+            onBlur={onNoteBlur}
+            placeholder="Ghi chú cho khách này (VD: hẹn gọi lại tối, khách khó tính...)"
+            rows={3}
+            style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 8, border: "1px solid #e5e7eb", background: "#fffbeb", fontSize: 13, fontFamily: "inherit", resize: "vertical", minHeight: 60 }}
+          />
+        </div>
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
@@ -877,6 +1084,13 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
             )}
             {!loading && !orderId && aiOk && (
               <div style={{ color: "#888", fontSize: 12, marginTop: 6 }}>Đã tự điền từ chat. Bạn kiểm tra lại trước khi lưu.</div>
+            )}
+            {!loading && warnings.length > 0 && (
+              <div style={{ color: "#b45309", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 6, padding: "6px 8px", fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
+                {warnings.map((w, k) => (
+                  <div key={k}>⚠️ {w}</div>
+                ))}
+              </div>
             )}
 
             <label style={labelStyle}>Tên người nhận</label>
@@ -932,40 +1146,49 @@ function OrderPanel({ conversationId, pageId, onChanged }) {
         {saved.length === 0 && !formOpen && (
           <div style={{ fontSize: 13, color: "#9ca3af", fontStyle: "italic" }}>Khách này chưa có đơn nào.</div>
         )}
-        {saved.map((o) => (
+        {[...saved.filter((x) => statusOf(x) !== "returned"), ...saved.filter((x) => statusOf(x) === "returned")].map((o, idx, arr) => (
+          <Fragment key={o.id}>
+          {statusOf(o) === "returned" && (idx === 0 || statusOf(arr[idx - 1]) !== "returned") && (
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: "#dc2626", margin: "12px 0 6px" }}>
+              Đơn đã hủy ({arr.filter((x) => statusOf(x) === "returned").length})
+            </div>
+          )}
           <div
-            key={o.id}
             style={{ border: orderId === o.id ? "1px solid #16a34a" : "1px solid #e5e7eb", borderRadius: 10, marginBottom: 10, fontSize: 13, background: "#fff", overflow: "hidden" }}
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 10px", background: ORDER_STATUS[statusOf(o)].color, color: "#fff" }}>
-              <strong>Đơn #{o.id} · {ORDER_STATUS[statusOf(o)].label}</strong>
+              <strong>Đơn #{o.id} · {ORDER_STATUS[statusOf(o)].label}{o.auto ? " · 🤖 tự tạo, cần kiểm tra" : ""}</strong>
               <span style={{ display: "flex", alignItems: "center", gap: 2 }}>
                 <button onClick={() => startEdit(o)} title="Sửa đơn" aria-label="Sửa đơn" style={{ ...iconBtn, color: "#fff" }}>✏️</button>
                 <button onClick={() => removeSaved(o.id)} title="Xóa đơn" aria-label="Xóa đơn" style={{ ...iconBtn, color: "#fff" }}>🗑</button>
               </span>
             </div>
             <div style={{ padding: "8px 10px", lineHeight: 1.65 }}>
+              <div style={statusOf(o) === "returned" ? { opacity: 0.6, textDecoration: "line-through" } : {}}>
               <div>👤 {o.customerName}{o.phone ? ` — ${o.phone}` : ""}</div>
               <div>📍 {o.address}</div>
               <div>🛍 {o.productName}{o.variant ? ` - ${o.variant}` : ""} × {o.quantity}</div>
+              {Array.isArray(o.review) && o.review.length > 0 ? <div style={{ color: "#b45309", fontSize: 12 }}>⚠️ Cần xác minh: {o.review.join("; ")}</div> : null}
               <div style={{ color: "#555" }}>Đơn giá: {money(o.unitPrice)} · Ship: {money(o.shipFee)}</div>
               {o.note ? <div>📝 {o.note}</div> : null}
               <div style={{ color: "#c0392b", fontWeight: 600 }}>Tổng thu: {money(o.total)}</div>
               <div style={{ color: "#999", fontSize: 12 }}>{fmtDateTime(o.createdAt)}</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 6, paddingTop: 6, borderTop: "1px dashed #e5e7eb" }}>
-                {[["shipped", "Đã gửi hàng"], ["delivered", "Đã giao"], ["returned", "Hoàn / Hủy"]].map(([k, label]) => {
-                  const st = statusOf(o);
-                  const checked = k === "shipped" ? st === "shipped" || st === "delivered" : st === k;
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "4px 14px", marginTop: 6, paddingTop: 6, borderTop: "1px dashed #e5e7eb" }}>
+                {(() => {
+                  const checked = statusOf(o) === "returned";
                   return (
-                    <label key={k} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", fontSize: 13, color: checked ? ORDER_STATUS[k].color : "#555", fontWeight: checked ? 600 : 400 }}>
-                      <input type="checkbox" checked={checked} onChange={() => toggleStatus(o, k)} style={{ width: 16, height: 16, cursor: "pointer" }} />
-                      {label}
+                    <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", fontSize: 13, color: checked ? "#dc2626" : "#555", fontWeight: checked ? 600 : 400 }}>
+                      <input type="checkbox" checked={checked} onChange={() => toggleStatus(o, "returned")} style={{ width: 16, height: 16, cursor: "pointer" }} />
+                      Hủy đơn
                     </label>
                   );
-                })}
+                })()}
+                {statusOf(o) === "returned" && <RefundInput order={o} onSaved={() => { loadSaved(); onChanged && onChanged(); }} />}
               </div>
             </div>
           </div>
+          </Fragment>
         ))}
       </div>
     </aside>
@@ -1253,7 +1476,7 @@ export default function ChatAdminPage() {
   const shownConversations = conversations.filter((c) => {
     if (orderFilter === "all") return true;
     const list = ordersByConv[c.id] || [];
-    if (orderFilter === "none") return list.length === 0;
+    if (orderFilter === "has") return list.some((o) => statusOf(o) !== "returned");
     return list.some((o) => statusOf(o) === orderFilter);
   });
   const filtering = timePreset !== "all" || orderFilter !== "all";
@@ -1416,6 +1639,16 @@ export default function ChatAdminPage() {
           <BoxIcon />
         </a>
         {isOwner && (
+          <a href="/admin/ban-hang" title="Quản lý bán hàng (đơn, doanh thu, quảng cáo)" aria-label="Quản lý bán hàng" style={navButtonStyle}>
+            <ReceiptIcon />
+          </a>
+        )}
+        {isOwner && (
+          <a href="/admin/doc-don" title="Độ chính xác đọc đơn (AI so với hệ thống)" aria-label="Độ chính xác đọc đơn" style={{ ...navButtonStyle, fontWeight: 700, fontSize: 15 }}>
+            %
+          </a>
+        )}
+        {isOwner && (
 <button
           onClick={toggleBot}
           style={{
@@ -1571,11 +1804,8 @@ export default function ChatAdminPage() {
               aria-label="Lọc theo tình trạng đơn"
             >
               <option value="all">Tất cả</option>
-              <option value="none">Chưa có đơn</option>
-              <option value="draft">Mới tạo (chưa gửi)</option>
-              <option value="shipped">Đã gửi hàng</option>
-              <option value="delivered">Đã giao</option>
-              <option value="returned">Hoàn / Hủy</option>
+              <option value="has">Có đơn</option>
+              <option value="returned">Đã hủy (đã tích Hủy đơn)</option>
             </select>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, fontSize: 12.5, color: "#6b7280" }}>
               <span>
@@ -1757,14 +1987,21 @@ export default function ChatAdminPage() {
                 {(ordersByConv[c.id] || []).length > 0 && (
                   <div style={{ fontSize: 12, color: "#166534", marginTop: 2 }}>
                     🧾 {ordersByConv[c.id].length} đơn
-                    {Object.keys(ORDER_STATUS).map((k) => {
-                      const n = ordersByConv[c.id].filter((o) => statusOf(o) === k).length;
-                      return n ? (
-                        <span key={k} style={{ marginLeft: 6, color: ORDER_STATUS[k].color }}>
-                          · {n} {ORDER_STATUS[k].label.toLowerCase()}
+                    {(() => {
+                      // Đơn mới nhất chưa hủy (danh sách đã xếp mới → cũ)
+                      const latest = ordersByConv[c.id].find((o) => statusOf(o) !== "returned");
+                      return latest ? (
+                        <span style={{ marginLeft: 6, fontWeight: 600 }} title={`Đơn mới nhất · ${ORDER_STATUS[statusOf(latest)].label}`}>
+                          · mới nhất {money(orderTotal(latest))}
                         </span>
                       ) : null;
-                    })}
+                    })()}
+                    {(() => {
+                      const n = ordersByConv[c.id].filter((o) => statusOf(o) === "returned").length;
+                      return n ? (
+                        <span style={{ marginLeft: 6, color: ORDER_STATUS.returned.color }}>· {n} đã hủy</span>
+                      ) : null;
+                    })()}
                   </div>
                 )}
               </div>

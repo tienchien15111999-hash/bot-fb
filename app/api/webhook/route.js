@@ -3,9 +3,16 @@
 // Deploy lên Vercel cùng project Next.js hiện tại, URL webhook sẽ là:
 //   https://your-domain.com/api/webhook
 
+import { isShortMessage, burstWaitApplies } from "@/lib/shortMessage";
+import { crossCheckBody, applyCrossBody, dropKnownBodyAsks } from "@/lib/bodyCross";
+import { ruleRows, pickRewrites, applyRewritesToTexts, rewriteTurnNote } from "@/lib/customerRewrite";
+import { orderByCustomerSequence } from "@/lib/replyOrder";
+import { classifyContactMessage, shouldReleaseHold, contactAiEnabled } from "@/lib/contactKind";
+import { createHmac, timingSafeEqual } from "crypto";
+import { waitUntil } from "@vercel/functions";
 import { put } from "@vercel/blob";
-import { getProducts, filterProductsForPage, formatProductsForPrompt, norm, normKey, matchProduct, openingImageList } from "@/lib/products";
-import {
+import { getProducts, filterProductsForPage, formatProductsForPrompt, norm, normKey, matchProduct, openingImageList, catalogImageList, isCatalogQuestion, isBodySizedProduct, isApparelProduct, isModelPhotoQuestion, mentionsSpecificColor, lengthPhotoAsk } from "@/lib/products";
+import { getSentImageUrls,
   addMessage,
   ensureProfile,
   getRecentMessages,
@@ -21,6 +28,7 @@ import {
   getLatestCustomerMessageId,
   getMaxOutgoingId,
   getPendingCustomerMessages,
+  setMessageNorm,
   getLastOpeningAgeMs,
   getRecentOutgoingWithAge,
   isInOpeningWindow,
@@ -33,44 +41,60 @@ import {
   mergeCustomerInfo,
   extractPhone,
   isConversationBotOff,
+  setConversationBotOff,
+  getOwnerPriceTexts,
+  getOutgoingTexts,
 } from "@/lib/conversations";
-import { removeRepeatedAsks, removeInfoAsks, recentAskedTopics, softenRepeatedInfoAsks } from "@/lib/replyDedupe";
+import { ownerPriceNote } from "@/lib/dealPrice";
+import { hasLadder, computePriceContext, priceTurnNote, finalizePriceReply, buildSummaryText, buildOrderMessages, summarySentBefore, productNeedsVariant, isOrderClosingMessage, looksLikeOrderBlock } from "@/lib/priceLadder";
+
+// Chỉ coi là "kiểm tra đơn / xem lại đơn" khi nói về ĐƠN hoặc THÔNG TIN đặt hàng. "Kiểm tra hàng thoải mái", "ưng thì trả" (chính sách đổi trả) KHÔNG tính.
+const ORDER_CHECK_RE = /(đơn|thông tin|địa chỉ|sđt)[^.!?\n]{0,25}(kiểm tra|xem lại)|(kiểm tra|xem lại)[^.!?\n]{0,25}(đơn|thông tin|địa chỉ|sđt)|kiểm tra (giúp|hộ|lại)\b|xem lại (giúp|hộ)\b/i;
+function mentionsOrderCheck(t) {
+  const x = String(t || "");
+  if (/kiểm tra (hàng|sản phẩm|trước|thoải mái)/i.test(x) && !/(đơn|thông tin|địa chỉ|sđt)[^.!?\n]{0,25}(kiểm tra|xem lại)|(kiểm tra|xem lại)[^.!?\n]{0,25}(đơn|thông tin|địa chỉ|sđt)/i.test(x)) return false;
+  return ORDER_CHECK_RE.test(x);
+}
+import { softenPushyChoice, attributesComplete, applyItemsToStatus, productAttributes, attributeStatus, attributeTurnNote, composeVariant, progressedBy, topicsToUnblock, measuredItems, matchValues, reconcileWithReply, nextAttrToAsk, colorCount, summaryDetail, confirmItems, buildConfirmAsk, sanitizeVariant } from "@/lib/attributes";
+import { pickAddressFromTexts } from "@/lib/pickAddress";
+import { aiSaysNotAddress } from "@/lib/addressNet";
+import { addressInTexts, phoneInTexts } from "@/lib/contactGiven";
+import { fixGluedSize, fixUnitWords, removeRepeatedAsks, removeInfoAsks, recentAskedTopics, softenRepeatedInfoAsks, askedTopics, notesForbidPronouns, pronounsFrom, isWorryText, bodyInfoGiven, looksLikeAddress, looksLikeAddressStrict, isLocationOnlyText, HEIGHT_TEXT_RE as HEIGHT_RE, WEIGHT_TEXT_RE as WEIGHT_RE } from "@/lib/replyDedupe";
 import { readAskConfig, maybeRunNudge } from "@/lib/nudge";
+import { cleanReplyList } from "@/lib/replyGuard";
 import { acquireReplyLock, releaseReplyLock } from "@/lib/replyLock";
 import { getSettings } from "@/lib/settings";
 import { getPageToken, isPageBotEnabled } from "@/lib/pages";
 import { getAllRawKeys } from "@/lib/apiKeys";
-import { buildSystemPrompt } from "@/lib/botPrompt";
-import { listOrders } from "@/lib/orders";
-import { buildOrderContext } from "@/lib/orderContext";
+import { callGemini } from "@/lib/gemini";
+import { reportError, errText } from "@/lib/alert";
+import { missingContactAsk } from "@/lib/contactAsk";
+import { analyzeDefer, dropAsksForDeferred } from "@/lib/laterStop";
+import { analyzeHesitation, hesitateNote, dropPushyClose } from "@/lib/hesitate";
+import { readOrder, savedItemsStillValid } from "@/lib/orderItems";
+import { logReading, alertConflict, saveItems, getSavedItems } from "@/lib/orderReading";
+import { notifyBotOffMessage, markHandled, runUnansweredWatch } from "@/lib/unanswered";
+import { isComplexTurn, modelsForTurn } from "@/lib/modelPick";
+import { buildSystemPrompt, buildCompactSystemPrompt } from "@/lib/botPrompt";
+import { tidyAddress, tidyName } from "@/lib/textTidy";
+import { listOrders, isUnconfirmedAuto } from "@/lib/orders";
+import { syncAutoOrder } from "@/lib/autoOrder";
+import { customerQtyHint, qtyFromReplies } from "@/lib/orderFacts";
+import { buildOrderContext, parseDeliveryDays } from "@/lib/orderContext";
 import { getTrainingForPrompt } from "@/lib/training";
+import { detectSituation, shouldClassify, classifySituation, situationNote } from "@/lib/situation";
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
 // GOOGLE_API_KEY (biến môi trường) + các key thêm bằng nút 🔑 trên trang quản trị — xem lib/apiKeys.js
 // Vercel cho hàm chạy tối đa 60s (mặc định có thể chỉ 10-15s → dễ bị cắt giữa chừng khi AI chậm)
 export const maxDuration = 60;
 
-// ---- Chọn model Gemini ổn định ----
-// Thứ tự thử: model chính (đặt qua biến môi trường GEMINI_MODEL nếu muốn đổi mà không sửa code)
-// → các model dự phòng. Model nào lỗi (hết quota, quá tải, không tồn tại) sẽ tự chuyển sang model kế tiếp.
-// Thêm/bớt model dự phòng bằng GEMINI_FALLBACK_MODELS="model-a,model-b" (không bắt buộc).
-const DEFAULT_MODEL_CHAIN = [
-  "gemini-3.6-flash", // bản stable — thử đầu tiên (bỏ gemini-3.8-flash vì hạn mức thấp)
-  "gemini-3.5-flash", // bản stable
-  "gemini-3.5-flash-lite", // nhẹ, quota rộng — chốt chặn cuối
-];
-const MODEL_CHAIN = [
-  ...new Set(
-    [
-      process.env.GEMINI_MODEL,
-      ...(process.env.GEMINI_FALLBACK_MODELS ? process.env.GEMINI_FALLBACK_MODELS.split(",") : DEFAULT_MODEL_CHAIN),
-    ]
-      .map((m) => (m || "").trim().replace(/^models\//, ""))
-      .filter(Boolean)
-  ),
-];
-// Có thể đổi bằng biến môi trường trên Vercel (GEMINI_TIMEOUT_MS, REPLY_BUDGET_MS) mà không cần sửa code.
-const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 10000; // mỗi lần gọi chờ tối đa 10s rồi chuyển model/key khác (trước là 18s → khách phải chờ lâu khi model đầu chậm)
+// Trả lời Facebook (200) NGAY khi nhận tin, việc chờ gom tin + soạn + gửi chạy NỀN (waitUntil) cho tới khi xong.
+// Lý do: nếu giữ kết nối mở suốt lúc chờ 6 giây + soạn tin, Facebook chỉ chuyển tin kế tiếp của khách sau khi lượt trước xong
+// → bot không bao giờ thấy tin mới trong lúc chờ nên không gom được. Đặt WEBHOOK_BACKGROUND=0 trên Vercel để quay về cách cũ.
+const WEBHOOK_BACKGROUND = process.env.WEBHOOK_BACKGROUND !== "0";
+
+// Model, key, cách nghỉ khi lỗi... nằm chung ở lib/gemini.js (đổi GEMINI_MODEL, GEMINI_FALLBACK_MODELS, GEMINI_TIMEOUT_MS ở Vercel nếu cần).
 const REPLY_BUDGET_MS = Number(process.env.REPLY_BUDGET_MS) || 45000; // tổng thời gian dành cho AI trong 1 tin nhắn
 // ---- Khách MỚI nhắn liền mấy tin: chỉ gửi ảnh mẫu + câu mở đầu, các tin còn lại chờ khách nhắn tiếp ----
 // Khách mới (chưa ai trả lời) → chờ ngần này ms KỂ TỪ TIN ĐẦU TIÊN (12s), hết giờ mới gửi ảnh mẫu + câu mở đầu.
@@ -89,23 +113,87 @@ const REPLY_DEBOUNCE_MS = process.env.REPLY_DEBOUNCE_MS !== undefined ? Number(p
 // Khách nhắn dồn dập (tin thứ 2, 3... khi tin trước chưa được trả lời, hoặc nhắn tiếp ngay sau khi bot vừa trả lời):
 // chờ ngần này ms cho khách gõ xong rồi trả lời MỘT lần. Tin ĐẦU của khách vẫn trả lời nhanh, không chờ. Đặt 0 để tắt.
 const BURST_WAIT_MS = process.env.BURST_WAIT_MS !== undefined ? Number(process.env.BURST_WAIT_MS) : 1200;
+// Khách gửi ẢNH (không kèm chữ) để hỏi: chờ ngần này ms cho khách kịp nhắn thêm câu hỏi rồi mới trả lời. Đặt 0 để tắt.
+const IMAGE_WAIT_MS = process.env.IMAGE_WAIT_MS !== undefined ? Number(process.env.IMAGE_WAIT_MS) : 15000;
+// Khách ĐÃ CÓ cuộc trò chuyện nhắn tin NGẮN (ít hơn SHORT_MSG_WORDS chữ, vd "sai s", "46k", "2c"): chờ ngần này ms (6s) cho khách gõ tiếp
+// rồi trả lời MỘT lần cho cả loạt (mỗi tin ngắn mới của khách tính lại 6s từ đầu; chỉ tin cuối của loạt đi tiếp, các tin trước tự dừng).
+// Tin dài từ SHORT_MSG_WORDS chữ trở lên, ảnh, nút bấm (postback) thì không chờ thêm. Đặt SHORT_MSG_WAIT_MS=0 để tắt.
+const SHORT_MSG_WAIT_MS = process.env.SHORT_MSG_WAIT_MS !== undefined && process.env.SHORT_MSG_WAIT_MS !== "" ? Number(process.env.SHORT_MSG_WAIT_MS) : 6000;
+const SHORT_MSG_WORDS = process.env.SHORT_MSG_WORDS !== undefined && process.env.SHORT_MSG_WORDS !== "" ? Number(process.env.SHORT_MSG_WORDS) : 5;
 const BURST_RECENT_MS = process.env.BURST_RECENT_MS !== undefined ? Number(process.env.BURST_RECENT_MS) : 10000;
 // Luật CŨ (chỉ dùng khi "Thời gian hỏi lại thông tin" = 0 giây): không hỏi/xin lại điều đã hỏi trong N tin chữ gần nhất (mặc định 3). Đặt 0 để tắt.
 // Luật MỚI (mặc định): câu hỏi LẤY THÔNG TIN (màu, size, SĐT, địa chỉ...) chỉ được hỏi lại sau "Thời gian hỏi lại thông tin" giây (cài ở trang sản phẩm).
 const NO_REPEAT_QUESTION_LAST = process.env.NO_REPEAT_QUESTION_LAST !== undefined ? Number(process.env.NO_REPEAT_QUESTION_LAST) : 3;
 // Mỗi khách chỉ 1 lượt trả lời chạy cùng lúc; tin đến sau xếp hàng chờ tối đa ngần này ms (25s). Đặt 0 để tắt.
 const REPLY_LOCK_WAIT_MS = process.env.REPLY_LOCK_WAIT_MS !== undefined ? Number(process.env.REPLY_LOCK_WAIT_MS) : 25000;
-const SECOND_MSG_HOLD_MS = process.env.SECOND_MSG_HOLD_MS !== undefined ? Number(process.env.SECOND_MSG_HOLD_MS) : 600;
-// Tin đầu tiên: giả gõ từ lúc nhận tin của khách, gửi sau 1s (câu ngắn) đến 1,5s (câu dài). AI soạn lâu hơn thì gửi ngay khi soạn xong.
-const TYPING_MIN_MS = process.env.TYPING_MIN_MS !== undefined ? Number(process.env.TYPING_MIN_MS) : 600;
-const TYPING_MAX_MS = process.env.TYPING_MAX_MS !== undefined ? Number(process.env.TYPING_MAX_MS) : 900;
+
+// ---- Khách đang được xin SĐT + địa chỉ mà mới đưa MỘT trong 2 (chỉ SĐT hoặc chỉ địa chỉ) ----
+// Bot chờ ĐÚNG ngần này ms (tính từ lúc nhận tin) cho khách gửi nốt phần còn lại; hết giờ khách vẫn im mới hỏi phần còn thiếu.
+// Khách gửi nốt trong lúc chờ → tin cuối trả lời chung cho cả 2 tin (không hỏi thừa). Không cần dịch vụ hẹn giờ (cron): bot tự chờ trong lượt trả lời.
+// Đặt PAIR_WAIT_MS=0 (trên Vercel) để tắt.
+const PAIR_WAIT_MS = process.env.PAIR_WAIT_MS !== undefined && process.env.PAIR_WAIT_MS !== "" ? Number(process.env.PAIR_WAIT_MS) : 30000;
+/**
+ * Shop vừa xin SĐT + địa chỉ, khách mới đưa MỘT trong 2 (tính cả các tin khách chưa được trả lời) → true: cần chờ khách gửi nốt.
+ */
+async function contactHalfOnly(senderId, text) {
+  try {
+    const phoneNow = !!extractPhone(text);
+    const addrNow = looksLikeAddress(text);
+    if (phoneNow === addrNow) return false; // đưa cả 2 trong 1 tin, hoặc không phải tin thông tin liên hệ
+    const [recent, info, pend] = await Promise.all([
+      getRecentOutgoingTexts(senderId, 0, 3).catch(() => []),
+      getCustomerInfo(senderId).catch(() => ({})),
+      getPendingCustomerMessages(senderId).catch(() => []),
+    ]);
+    const asked = (recent || []).some((t) => {
+      const a = askedTopics(t);
+      return a.has("so dien thoai") || a.has("dia chi");
+    });
+    if (!asked) return false; // shop chưa hỏi SĐT/địa chỉ → không phải đang trả lời câu hỏi đó
+    const texts = [text, ...(pend || []).map((m) => (typeof m === "string" ? m : m?.text || ""))];
+    const havePhone = !!String(info?.phone || "").trim() || texts.some((t) => !!extractPhone(t));
+    const haveAddr = !!String(info?.address || "").trim() || texts.some((t) => looksLikeAddress(t));
+    return !(havePhone && haveAddr);
+  } catch (e) {
+    console.error("Lỗi kiểm tra khách mới đưa 1 nửa SĐT/địa chỉ:", e.message);
+    return false;
+  }
+}
+// Luật chữ nói "khách mới đưa 1 nửa SĐT/địa chỉ" → nhờ AI nhẹ xem lại. AI CHỈ được hủy việc chờ (tin thật ra là câu hỏi về sản phẩm,
+// hoặc khách đã đưa đủ cả hai); AI lỗi / hết giờ / nói "đúng là 1 nửa" → vẫn chờ như cũ. Tắt bằng CONTACT_AI=off. Xem lib/contactKind.js.
+async function contactAiReleasesHold(senderId, text) {
+  try {
+    if (!contactAiEnabled()) return false;
+    const [keys, recent, pend] = await Promise.all([
+      getAllRawKeys(),
+      getRecentOutgoingTexts(senderId, 0, 3).catch(() => []),
+      getPendingCustomerMessages(senderId).catch(() => []),
+    ]);
+    const botAsk = (recent || []).find((t) => {
+      const a = askedTopics(t);
+      return a.has("so dien thoai") || a.has("dia chi");
+    }) || "";
+    const pendingTexts = (pend || []).map((m) => (typeof m === "string" ? m : m?.text || "")).filter(Boolean);
+    const kind = await classifyContactMessage({ text, pendingTexts, botAsk, keys });
+    console.log("AI phân loại tin liên hệ:", text, "→", kind || "(bỏ qua / lỗi → giữ chờ như cũ)");
+    return shouldReleaseHold(kind);
+  } catch (e) {
+    console.error("Lỗi AI phân loại tin liên hệ (giữ chờ như cũ):", e.message);
+    return false;
+  }
+}
+// Tin thứ 2 (khi bot tách 2 tin): mặc định giả gõ ~1-4,5s tùy độ dài. Đặt SECOND_MSG_HOLD_MS (ms) để cố định.
+const SECOND_MSG_HOLD_MS = process.env.SECOND_MSG_HOLD_MS !== undefined ? Number(process.env.SECOND_MSG_HOLD_MS) : null;
+// Tin đầu tiên: giả gõ từ lúc nhận tin của khách, gửi sau ~1,5s (câu ngắn) đến 6s (câu dài) — người thật không trả lời 3 dòng trong 1 giây. AI soạn lâu hơn thì gửi ngay khi soạn xong.
+const TYPING_MIN_MS = process.env.TYPING_MIN_MS !== undefined ? Number(process.env.TYPING_MIN_MS) : 1500;
+const TYPING_MAX_MS = process.env.TYPING_MAX_MS !== undefined ? Number(process.env.TYPING_MAX_MS) : 6000;
+const TYPING_PER_CHAR_MS = process.env.TYPING_PER_CHAR_MS !== undefined ? Number(process.env.TYPING_PER_CHAR_MS) : 40;
+const humanJitter = () => 0.85 + Math.random() * 0.3; // lệch ±15% cho khỏi đều đều như máy
 // Khách nhắn thêm trong ngần này ms sau tin bot vừa gửi → dặn AI: câu trước trả lời hơi sớm, chỉ trả lời phần mới, không hỏi lại/lặp lại.
 const FOLLOWUP_AFTER_BOT_MS = process.env.FOLLOWUP_AFTER_BOT_MS !== undefined ? Number(process.env.FOLLOWUP_AFTER_BOT_MS) : 10000;
 // AI lỗi (hết quota, quá tải...) → KHÔNG gửi câu xin lỗi/chờ cho khách, để chủ shop tự nhắn tay hoặc đợi khách nhắn tiếp.
 // Muốn bot vẫn gửi câu "chờ shop một chút" khi lỗi thì đặt biến môi trường SILENT_ON_ERROR=0 trên Vercel.
 const SILENT_ON_ERROR = process.env.SILENT_ON_ERROR !== "0";
-const modelDown = new Map(); // model → thời điểm được thử lại (model đang quá tải 503 với MỌI key → bỏ qua ngay, khỏi tốn thời gian)
-const modelCooldown = new Map(); // `${model}::${keyId}` → thời điểm được thử lại (bỏ qua cặp model+key vừa lỗi)
 
 // ---- 1. Facebook gọi GET để xác minh webhook khi bạn cấu hình trên Meta ----
 export async function GET(req) {
@@ -120,15 +208,56 @@ export async function GET(req) {
   return new Response("Forbidden", { status: 403 });
 }
 
+// ---- Chỉ nhận tin THẬT từ Facebook ----
+// Facebook ký mỗi tin bằng "App Secret" (header x-hub-signature-256). Trên Vercel đặt biến FB_APP_SECRET (Meta for Developers → App → Settings → Basic → App Secret)
+// → bot bỏ qua mọi tin giả do người lạ gửi vào đường dẫn webhook (tránh bị spam, tốn tiền AI, gửi tin bậy cho khách).
+// Chưa đặt FB_APP_SECRET thì bot chạy như cũ (không kiểm tra). Có thể đặt nhiều App Secret, cách nhau dấu phẩy.
+function validFacebookSignature(rawBody, header) {
+  const secrets = String(process.env.FB_APP_SECRET || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (!secrets.length) return true;
+  const got = String(header || "").replace(/^sha256=/i, "");
+  if (!/^[0-9a-f]{64}$/i.test(got)) return false;
+  const gotBuf = Buffer.from(got, "hex");
+  return secrets.some((sec) => {
+    const exp = createHmac("sha256", sec).update(rawBody).digest();
+    return exp.length === gotBuf.length && timingSafeEqual(exp, gotBuf);
+  });
+}
+
 // ---- 2. Facebook gọi POST mỗi khi có tin nhắn mới từ khách ----
 export async function POST(req) {
   const startedAt = Date.now();
-  const body = await req.json();
+  const rawBuf = Buffer.from(await req.arrayBuffer()); // đúng từng byte Facebook gửi (để kiểm tra chữ ký)
+  const rawBody = rawBuf.toString("utf8");
+  if (!validFacebookSignature(rawBuf, req.headers.get("x-hub-signature-256"))) {
+    console.error("Webhook: chữ ký Facebook không hợp lệ → bỏ qua (kiểm tra biến FB_APP_SECRET nếu tin thật cũng bị bỏ)");
+    await reportError("fb_signature_invalid", "Webhook từ chối tin vì chữ ký Facebook sai", { "Gợi ý": "Nếu khách nhắn thật mà bot im lặng → kiểm tra biến FB_APP_SECRET trên Vercel. Nếu chỉ thỉnh thoảng thì có thể là người lạ dò đường, bỏ qua." }, { gapMs: 60 * 60 * 1000 });
+    return new Response("Invalid signature", { status: 403 });
+  }
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return new Response("Bad request", { status: 400 });
+  }
 
-  if (body.object !== "page") {
+  if (!body || body.object !== "page") {
     return new Response("Not a page event", { status: 404 });
   }
 
+  const work = processWebhookBody(body, startedAt).catch((e) => console.error("Lỗi xử lý webhook:", e));
+  if (WEBHOOK_BACKGROUND) waitUntil(work); // trả 200 ngay, việc xử lý chạy tiếp nền (vẫn tính trong maxDuration)
+  else await work;
+
+  // Luôn trả 200 cho Facebook để nó không gửi lại (retry) sự kiện
+  return new Response("EVENT_RECEIVED", { status: 200 });
+}
+
+// Xử lý toàn bộ sự kiện của 1 lần Facebook gọi webhook (gom tin, soạn, gửi trả lời, nhắn bồi...)
+async function processWebhookBody(body, startedAt) {
   for (const entry of body.entry ?? []) {
     // entry.id = ID của Fanpage nhận tin → dùng đúng token của Page đó để trả lời
     const pageId = entry.id ? String(entry.id) : null;
@@ -143,18 +272,24 @@ export async function POST(req) {
 
       const senderId = event.sender?.id;
       // Khách gõ chữ, hoặc bấm câu hỏi có sẵn/nút (Facebook gửi dạng postback, "title" chính là câu hỏi)
-      const text = event.message?.text || event.postback?.title || "";
+      let text = event.message?.text || event.postback?.title || "";
       const mid = event.message?.mid || event.postback?.mid || "";
       // Ảnh khách gửi (bỏ qua sticker/like)
       const fbImages = (event.message?.attachments || [])
         .filter((a) => a.type === "image" && a.payload?.url && !a.payload?.sticker_id)
         .map((a) => a.payload.url);
+      // Khách gửi tin thoại / video / file / vị trí (không chữ, không ảnh): lưu thành 1 dòng ghi chú để bot trả lời (nhờ khách nhắn chữ) thay vì im lặng
+      if (!text && !fbImages.length) text = nonTextAttachmentNote(event.message?.attachments);
 
       // Bỏ qua echo, tin nhắn không có chữ lẫn ảnh, v.v.
       if (!senderId || event.message?.is_echo || (!text && !fbImages.length)) continue;
 
       let openedProductId = null; // sản phẩm vừa giữ chỗ gửi câu mở đầu (để trả lại nếu gửi lỗi)
       let lockToken = null; // khóa trả lời của khách này (trả lại ở cuối, dù thành công hay lỗi)
+      let phoneInMsg = null; // SĐT có trong tin khách vừa nhắn (nếu có)
+      let settingsNow = null; // cài đặt hiện tại (dùng lại ở bước cuối)
+      let orderP = null; // việc TỰ TẠO ĐƠN khi khách để lại SĐT (chạy song song với lúc bot soạn tin)
+      let wantOrderSync = false; // tin này đã xử lý xong → sau khi nhả khóa, điền thêm thông tin cho đơn tự tạo
       try {
         // Facebook có thể gửi lại đúng sự kiện này (khi webhook chậm) → chỉ xử lý 1 lần
         if (!(await claimEvent(mid).catch(() => true))) continue;
@@ -166,7 +301,7 @@ export async function POST(req) {
         );
         // Chạy SONG SONG (trước đây chờ lần lượt từng việc): hồ sơ khách, lưu SĐT, đọc cài đặt, kiểm tra bot của Page
         // Khách để lại số điện thoại → ghi nhớ ngay (không tốn AI)
-        const phoneInMsg = extractPhone(text);
+        phoneInMsg = extractPhone(text);
         const [, , settings, pageBotOn, convBotOff] = await Promise.all([
           ensureProfile(senderId, pageToken).catch((e) => console.error("Lỗi hồ sơ khách:", e.message)),
           phoneInMsg ? mergeCustomerInfo(senderId, { phone: phoneInMsg }).catch(() => {}) : null,
@@ -174,24 +309,38 @@ export async function POST(req) {
           isPageBotEnabled(pageId),
           isConversationBotOff(senderId).catch(() => false),
         ]);
+        settingsNow = settings;
+        // Khách để lại SĐT → tự tạo đơn nháp (chạy song song, không làm bot trả lời chậm đi). Làm cả khi bot đang tắt.
+        if (phoneInMsg) orderP = syncAutoOrder(senderId, { pageId, phone: phoneInMsg, settings, ai: false }).catch((e) => {
+          console.error("Lỗi tự tạo đơn:", e.message);
+          return reportError("auto_order_failed", "Lỗi tự tạo đơn nháp khi khách để lại SĐT", { "Khách": senderId, "Page": pageId, "Lỗi": errText(e) });
+        });
         if (settings.botEnabled === false) {
           // Bot đang tắt — chỉ lưu lại tin nhắn để chủ shop tự trả lời qua trang quản trị
+          wantOrderSync = true;
           continue;
         }
         if (!pageBotOn) {
           // Bot của riêng Page này đang tắt — chỉ lưu tin nhắn
+          wantOrderSync = true;
           continue;
         }
         if (convBotOff) {
           // Bot đang tắt riêng cho khách này — chỉ lưu tin nhắn để chủ shop tự trả lời
+          wantOrderSync = true;
+          // Báo chủ shop qua Telegram ngay (không để khách chờ mà không ai biết); lỗi Telegram không ảnh hưởng gì
+          const nameForAlert = await getCustomerName(senderId).catch(() => "");
+          await notifyBotOffMessage({ conversationId: senderId, name: nameForAlert, text: text || "[ảnh]" }).catch(() => {});
           continue;
         }
 
         // Khách MỚI nhắn liền mấy tin: chờ một chút cho khách gõ xong, chỉ tin CUỐI CÙNG của loạt mới đi tiếp
         // (các tin trước tự dừng) → bot chỉ trả lời 1 lần duy nhất.
-        const firstWaitMs = Number.isFinite(Number(settings.firstContactWaitSec)) && settings.firstContactWaitSec !== "" && settings.firstContactWaitSec !== undefined && settings.firstContactWaitSec !== null
+        const imageOnly = fbImages.length > 0 && !text;
+        let firstWaitMs = Number.isFinite(Number(settings.firstContactWaitSec)) && settings.firstContactWaitSec !== "" && settings.firstContactWaitSec !== undefined && settings.firstContactWaitSec !== null
           ? Math.max(0, Number(settings.firstContactWaitSec)) * 1000
           : FIRST_CONTACT_WAIT_MS;
+        if (imageOnly && firstWaitMs > 0) firstWaitMs = Math.max(firstWaitMs, IMAGE_WAIT_MS);
         const firstContact =
           firstWaitMs > 0 &&
           !!messageId &&
@@ -225,7 +374,24 @@ export async function POST(req) {
               getPendingCustomerMessages(senderId).catch(() => []),
               getLastOutgoingAgeMs(senderId).catch(() => null),
             ]);
-            if (pend.length >= 2 || (outAge !== null && outAge < BURST_RECENT_MS)) waitMs = Math.max(waitMs, BURST_WAIT_MS);
+            // Tin chữ DÀI (>= SHORT_MSG_WORDS chữ) không chờ gom: trả lời ngay (xem burstWaitApplies)
+            if (burstWaitApplies({ text, hasImages: fbImages.length > 0, pendCount: pend.length, outAgeMs: outAge, burstRecentMs: BURST_RECENT_MS, maxWords: SHORT_MSG_WORDS })) waitMs = Math.max(waitMs, BURST_WAIT_MS);
+          }
+          if (imageOnly && IMAGE_WAIT_MS > 0) waitMs = Math.max(waitMs, IMAGE_WAIT_MS); // ảnh không kèm chữ: chờ 15 giây cho khách nhắn thêm
+          // Tin ngắn (< SHORT_MSG_WORDS chữ, không kèm ảnh): chờ 6s cho khách gõ tiếp, chỉ tin cuối của loạt trả lời cho cả loạt
+          if (SHORT_MSG_WAIT_MS > 0 && text && !fbImages.length && isShortMessage(text, SHORT_MSG_WORDS)) {
+            if (SHORT_MSG_WAIT_MS > waitMs) console.log("Tin ngắn → chờ", Math.round(SHORT_MSG_WAIT_MS / 1000), "giây cho khách nhắn tiếp rồi trả lời 1 lần:", text);
+            waitMs = Math.max(waitMs, SHORT_MSG_WAIT_MS);
+          }
+          // Khách mới đưa MỘT trong 2 (SĐT hoặc địa chỉ) → chờ ĐÚNG 30 giây kể từ lúc nhận tin cho khách gửi nốt, hết giờ mới hỏi phần còn thiếu
+          if (PAIR_WAIT_MS > 0 && !imageOnly && (await contactHalfOnly(senderId, text))) {
+            if (await contactAiReleasesHold(senderId, text)) {
+              console.log("AI: tin này không phải 1 nửa SĐT/địa chỉ → không chờ 30 giây, trả lời ngay:", text);
+            } else {
+              const holdMs = Math.max(0, PAIR_WAIT_MS - (Date.now() - startedAt)); // tính SAU khi AI xem xong → tổng thời gian chờ vẫn là 30 giây kể từ lúc nhận tin
+              console.log("Khách mới đưa 1 nửa SĐT/địa chỉ → chờ", Math.round(holdMs / 1000), "giây cho khách gửi nốt:", text);
+              waitMs = Math.max(waitMs, holdMs);
+            }
           }
           if (waitMs > 0) await sleep(waitMs);
           if (waitMs > 0 && await hasNewerDifferentCustomerMessage(senderId, messageId, text).catch(() => false)) {
@@ -243,6 +409,7 @@ export async function POST(req) {
           (await isRepeatedMessage(senderId, text, messageId).catch(() => false))
         ) {
           console.log("Bỏ qua tin trùng của khách:", text);
+          await markHandled(senderId).catch(() => {});
           continue;
         }
 
@@ -290,6 +457,8 @@ export async function POST(req) {
         await typingP; // đảm bảo "đang gõ" đã gửi xong trước khi gửi tin / tắt "đang gõ"
         if (reply.skip) {
           await fbAction(senderId, "typing_off", pageToken);
+          wantOrderSync = true;
+          if (reply.deliberate) await markHandled(senderId).catch(() => {}); // bot chủ ý im lặng → không nhắc "khách chưa được trả lời"
           continue;
         }
 
@@ -301,7 +470,7 @@ export async function POST(req) {
           messageId &&
           (await hasNewerDifferentCustomerMessage(senderId, messageId, text).catch(() => false))
         ) {
-          console.log("Khách nhắn thêm trong lúc bot soạn → bỏ câu trả lời cũ, chờ tin mới nhất:", text);
+          console.log("Khách nhắn thêm trong lúc bot soạn → bỏ câu trả lời cho tin:", text, "→ chờ gộp với tin mới hơn");
           if (reply.openingProductId) await releaseOpening(senderId, reply.openingProductId).catch(() => {});
           continue;
         }
@@ -317,6 +486,8 @@ export async function POST(req) {
 
         const askGapMs = readAskConfig(settings).askGapMs;
         let sentCount = 0;
+        let orderBlockSent = false; // bảng đơn ("Em lên đơn ạ: ... SĐT ...") đã gửi thành công trong lượt này
+        let closingSent = false; // đã gửi xong câu chốt "Đơn hàng giao trong khoảng 3-4 ngày..." → hết việc của bot với khách này
         const sendTexts = async () => {
           for (let i = 0; i < messages.length; i++) {
             if (i > 0) {
@@ -325,8 +496,10 @@ export async function POST(req) {
             }
             // Tin đầu: giả gõ 1-1,5s tính từ lúc bắt đầu "đang gõ" (AI soạn lâu rồi thì gửi ngay).
             // Tin thứ 2: giả soạn ~1s; trong lúc đó khách nhắn thêm → hủy tin này, trả lời tin mới.
-            const typingMs = Math.min(TYPING_MAX_MS, TYPING_MIN_MS + messages[i].length * 5);
-            const waitMs = i > 0 ? SECOND_MSG_HOLD_MS : Math.max(0, typingMs - (Date.now() - typingStartedAt));
+            const typingMs = Math.min(TYPING_MAX_MS, TYPING_MIN_MS + messages[i].length * TYPING_PER_CHAR_MS) * humanJitter();
+            const holdMs = SECOND_MSG_HOLD_MS !== null ? SECOND_MSG_HOLD_MS : Math.min(4500, 900 + messages[i].length * 30) * humanJitter();
+            const waitRaw = i > 0 ? holdMs : Math.max(0, typingMs - (Date.now() - typingStartedAt));
+            const waitMs = Math.min(waitRaw, Math.max(0, startedAt + 52000 - Date.now())); // không để hàm Vercel (60s) bị cắt giữa chừng
             await sleep(waitMs);
             // Kiểm tra lần cuối ngay trước khi gửi từng tin
             if (await superseded()) {
@@ -334,20 +507,31 @@ export async function POST(req) {
               if (i === 0 && openedProductId) await releaseOpening(senderId, openedProductId).catch(() => {});
               return false;
             }
-            // Chống hỏi lặp. Luật mới: câu hỏi LẤY THÔNG TIN (màu, size, SĐT, địa chỉ...) mà bot/shop vừa hỏi chưa quá
-            // "Thời gian hỏi lại" thì bỏ câu hỏi đó, vẫn gửi phần trả lời. Lần đầu hỏi thì hỏi luôn, không chờ.
-            // "Thời gian hỏi lại" = 0 → dùng luật cũ (so với N tin gần nhất).
-            if (!reply.openingProductId) {
+            // Chống hỏi lặp. Luật: câu hỏi LẤY THÔNG TIN (màu, size, SĐT, địa chỉ...) mà bot/shop ĐÃ hỏi rồi thì bỏ câu hỏi đó, vẫn gửi phần trả lời.
+            // Lần đầu hỏi thì hỏi luôn. Hỏi lại khi khách chưa trả lời là việc của tin nhắn bồi (sau "Thời gian hỏi lại").
+            // "Thời gian hỏi lại" = 0 → dùng luật cũ (so với N tin gần nhất). Tin chốt đơn (khách vừa đưa SĐT/địa chỉ) không bị cắt.
+            if (!reply.openingProductId && !reply.skipAskClean) {
               let cleaned = messages[i];
               if (askGapMs > 0) {
                 const [rows, recent] = await Promise.all([
                   getRecentOutgoingWithAge(senderId, 15).catch(() => []),
                   NO_REPEAT_QUESTION_LAST > 0 ? getRecentOutgoingTexts(senderId, 0, NO_REPEAT_QUESTION_LAST).catch(() => []) : [],
                 ]);
-                const { topics } = recentAskedTopics(rows, askGapMs);
-                cleaned = removeInfoAsks(cleaned, topics);
-                // Đã hết thời gian chờ mà hỏi lại cùng thông tin → đổi sang câu NGẮN hơn, khác cách nói (lần đầu hỏi thì giữ nguyên)
-                if (cleaned) cleaned = softenRepeatedInfoAsks(cleaned, rows);
+                const unblock = reply.unblockTopics || [];
+                const { topics } = recentAskedTopics(rows, Infinity);
+                // Khách mới đưa MỘT nửa của cặp (chiều cao/cân nặng, SĐT/địa chỉ) → cho hỏi nốt nửa còn lại, không chặn
+                let blocked = new Set([...topics].filter((t) => !unblock.includes(t)));
+                // Khách đang lo lắng / nghi ngờ (đổi trả, mất ship, xem hàng...) → chỉ trấn an, KHÔNG hỏi thêm màu/size/SĐT/địa chỉ.
+                // Việc hỏi lại để tin nhắn bồi lo sau khi khách im.
+                if (!unblock.length && isWorryText(text)) blocked = new Set(["mau", "size", "so luong", "so dien thoai", "dia chi", "ten nguoi nhan"]);
+                const beforeClean = cleaned;
+                cleaned = removeInfoAsks(cleaned, blocked);
+                // Khách vừa nhắn mà câu duy nhất của bot bị cắt sạch (vd khách nói "tư vấn size giúp mình" khi bot đã hỏi cân nặng)
+                // → KHÔNG được im lặng: gửi lại đúng câu hỏi đó nhưng viết ngắn gọn/khác cách nói.
+                if (!cleaned && sentCount === 0 && i === messages.length - 1) {
+                  cleaned = softenRepeatedInfoAsks(beforeClean, rows, { neutral: !!reply.hasNotes }) || beforeClean;
+                }
+                if (cleaned && !unblock.length) cleaned = softenRepeatedInfoAsks(cleaned, rows, { neutral: !!reply.hasNotes });
                 // Các câu hỏi KHÁC (không phải lấy thông tin) vẫn không được hỏi y như câu vừa hỏi
                 if (cleaned && NO_REPEAT_QUESTION_LAST > 0) {
                   cleaned = removeRepeatedAsks(cleaned, recent, { skipInfo: true });
@@ -362,6 +546,16 @@ export async function POST(req) {
                 messages[i] = cleaned; // vẫn gửi phần còn lại của tin
               }
             }
+            // Shop đã có SĐT/địa chỉ/tên của khách → bỏ câu xin lại đúng thông tin đó (tin tóm tắt đơn của hệ thống không bị đụng tới)
+            if (!reply.systemOrder && (reply.knownTopics || []).length) {
+              const known = new Set(reply.knownTopics);
+              const trimmed = removeInfoAsks(messages[i], known);
+              if (trimmed !== messages[i]) {
+                console.log("Bỏ câu xin lại thông tin đã có:", messages[i], "→", trimmed || "(bỏ cả tin)");
+                if (!trimmed) continue;
+                messages[i] = trimmed;
+              }
+            }
             const delivered = await sendMessage(senderId, messages[i], pageToken);
             if (!delivered) {
               // Facebook từ chối (quá 24 giờ, token hết hạn...) → KHÔNG lưu như đã gửi, để bot/shop không tưởng khách đã nhận
@@ -372,6 +566,15 @@ export async function POST(req) {
               console.error("Không lưu được tin của bot:", e.message)
             );
             sentCount++;
+            if (looksLikeOrderBlock(messages[i])) orderBlockSent = true;
+            // Chỉ tính là chốt xong khi BẢNG ĐƠN đã gửi rồi, câu giao hàng 3-4 ngày gửi sau đó
+            else if (orderBlockSent && isOrderClosingMessage(messages[i])) closingSent = true;
+          }
+          // Chốt đơn xong (đã gửi câu giao hàng 3-4 ngày) → TẮT bot với khách này (chủ shop tự lo tiếp; bật lại bằng nút gạt trong khung chat)
+          if (closingSent && settings?.offAfterOrder !== false) {
+            await setConversationBotOff(senderId, true)
+              .then(() => console.log("Đã gửi câu chốt đơn → tắt bot với khách này."))
+              .catch((e) => console.error("Không tắt được bot sau khi chốt đơn:", e.message));
           }
           if (!sentCount) await fbAction(senderId, "typing_off", pageToken); // bỏ hết câu (toàn câu hỏi quá sớm) → tắt "đang gõ"
           return true;
@@ -400,18 +603,33 @@ export async function POST(req) {
           const sent = await sendTexts();
           if (sent) await sendImages();
         }
+        wantOrderSync = true;
       } catch (err) {
         console.error("Lỗi xử lý tin nhắn:", err);
+        await reportError("webhook_exception", "Lỗi khi xử lý tin nhắn của khách (khách có thể đã nhận câu xin lỗi)", {
+          "Khách": senderId,
+          "Page": pageId,
+          "Tin khách": text || (fbImages.length ? "[ảnh]" : ""),
+          "Lỗi": errText(err),
+        }, { gapMs: 5 * 60 * 1000 });
         if (openedProductId) await releaseOpening(senderId, openedProductId).catch(() => {});
         if (!SILENT_ON_ERROR) {
           await sendMessage(
             senderId,
-            "Dạ shop xin lỗi, hệ thống đang bận xíu, anh/chị nhắn lại giúp shop sau ít phút nha!",
+            "Dạ shop xin lỗi, hệ thống đang bận xíu, mình nhắn lại giúp shop sau ít phút nha!",
             pageToken
           ).catch(() => {});
         }
       } finally {
         if (lockToken) await releaseReplyLock(senderId, lockToken);
+        // Sau khi đã nhả khóa (khách nhắn tiếp không bị chờ): hoàn tất việc tự tạo đơn, rồi điền thêm địa chỉ/sản phẩm cho đơn đó
+        if (orderP) await orderP;
+        if (wantOrderSync && settingsNow) {
+          await syncAutoOrder(senderId, { pageId, phone: phoneInMsg, settings: settingsNow, ai: true, budgetMs: 52000 - (Date.now() - startedAt) }).catch((e) => {
+            console.error("Lỗi cập nhật đơn tự tạo:", e.message);
+            return reportError("auto_order_update_failed", "Lỗi cập nhật đơn tự tạo (điền địa chỉ/sản phẩm)", { "Khách": senderId, "Page": pageId, "Lỗi": errText(e) });
+          });
+        }
       }
     }
   }
@@ -423,10 +641,14 @@ export async function POST(req) {
     } catch (e) {
       console.error("Lỗi nhắn bồi (chạy kèm):", e.message);
     }
+    // Nhắc chủ shop các khách chờ quá lâu chưa ai trả lời (Telegram)
+    try {
+      await runUnansweredWatch();
+    } catch (e) {
+      console.error("Lỗi nhắc khách chờ (chạy kèm):", e.message);
+    }
   }
 
-  // Luôn trả 200 cho Facebook để nó không gửi lại (retry) sự kiện
-  return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
 // ---- Tin nhắn chủ Page tự gửi bằng điện thoại: lưu vào lịch sử để hiện trên web quản lý ----
@@ -534,7 +756,8 @@ function openingReply(p) {
 // ---- Gọi Google Gemini API: soạn câu trả lời + quyết định có gửi ảnh không ----
 const MAX_IMAGES = 10;
 // Câu dùng khi AI lỗi — không được đưa vào lịch sử để model không bắt chước
-const FALLBACK_TEXT = "Dạ anh/chị chờ shop một chút, shop kiểm tra rồi phản hồi mình ngay ạ.";
+const FALLBACK_TEXT = "Dạ mình chờ shop một chút, shop kiểm tra rồi phản hồi mình ngay ạ.";
+const LEGACY_FALLBACK_TEXT = "Dạ anh/chị chờ shop một chút, shop kiểm tra rồi phản hồi mình ngay ạ."; // bản cũ còn nằm trong lịch sử chat
 const OLD_FALLBACK = "Dạ shop chưa rõ ý anh/chị lắm";
 
 /** Tải ảnh (link Blob/Facebook) về dạng base64 để đưa cho Gemini xem. Lỗi thì bỏ qua. */
@@ -568,7 +791,7 @@ function isErrorText(t) {
 
 /** Xoá mọi ghi chú nội bộ kiểu "📷 [Bot đã gửi ...]" mà AI lỡ bắt chước viết vào tin gửi khách. */
 function stripBotNotes(t) {
-  return String(t || "")
+  return fixUnitWords(String(t || ""))
     .replace(/📷?\s*\[\s*(Bot|Shop|Hệ thống|Khách)\s+đã\s+gửi[^\]]*\]?/gi, "")
     .replace(/\[\s*(Bot|Shop)\s+đã\s+gửi[^\]]*\]/gi, "")
     .replace(/📷/g, "")
@@ -577,12 +800,15 @@ function stripBotNotes(t) {
     .trim();
 }
 
+/** AI đôi khi nhét tên trường kỹ thuật (send_images, customer_info...) vào danh sách tin nhắn → tuyệt đối không gửi cho khách. */
+const isInternalToken = (t) => /^[\W_]*(send_images|use_opening_product|customer_info|no_reply|messages|tinh_huong)\b/i.test(String(t || ""));
+
 /** Đổi lịch sử chat trong DB thành contents của Gemini (xen kẽ user/model, kết thúc bằng user). */
 async function buildContents(history, latestText, latestImages) {
   const items = [];
   for (const m of history) {
     const isCustomer = m.from === "customer";
-    if (!isCustomer && (m.text.startsWith(OLD_FALLBACK) || m.text === FALLBACK_TEXT || isErrorText(m.text))) continue;
+    if (!isCustomer && (m.text.startsWith(OLD_FALLBACK) || m.text === FALLBACK_TEXT || m.text === LEGACY_FALLBACK_TEXT || isErrorText(m.text))) continue;
     const imgs = isCustomer ? m.images || [] : [];
     const text = m.text || (imgs.length ? `[Khách gửi ${imgs.length} ảnh]` : "");
     if (text) items.push({ role: isCustomer ? "user" : "model", text, images: imgs });
@@ -625,8 +851,8 @@ async function buildContents(history, latestText, latestImages) {
 function salvageMessages(raw) {
   const t = String(raw || "").replace(/```json|```/g, "").trim();
   if (!t || isErrorText(t)) return [];
-  if (!/^[\[{]/.test(t) && !/"messages"\s*:/.test(t) && !/"use_opening_product"|"send_images"|"customer_info"/.test(t)) {
-    return [t]; // chữ bình thường, không phải JSON
+  if (!/^[\[{]/.test(t) && !/"messages"\s*:/.test(t) && !/"use_opening_product"|"send_images"|"customer_info"|"tinh_huong"/.test(t)) {
+    return cleanReplyList([t]); // chữ bình thường, không phải JSON (đã bóc phần phân tích/chữ lạ nếu AI lỡ viết ra)
   }
   const out = [];
   const m = t.match(/"messages"\s*:\s*\[([\s\S]*)/);
@@ -646,10 +872,43 @@ function salvageMessages(raw) {
  * Chỉ giữ thông tin mà khách THỰC SỰ đã nhắn (chống AI đoán bừa/bịa rồi lưu làm thật):
  * SĐT phải có đúng dãy số trong tin khách; tên/địa chỉ/màu-size phải có phần lớn từ xuất hiện trong tin khách.
  */
+// ---- Cặp thông tin hỏi gộp: (chiều cao + cân nặng), (SĐT + địa chỉ). Khách mới đưa MỘT nửa → được hỏi nốt nửa còn lại dù shop đã hỏi cặp này trước đó ----
+// HEIGHT_RE / WEIGHT_RE lấy từ lib/replyDedupe.js (hiểu cả 1,47m, 1.47m, 45 ký...)
+const PHONE_TEXT_RE = /(?:\+?84|0)\d{9}/;
+
+function partialPairTopics({ history, currentTexts, mergedInfo, verified, bodySized = true }) {
+  const out = new Set();
+  const cur = (currentTexts || []).join(" \n ");
+  // SĐT + địa chỉ: tin này khách đưa SĐT mà chưa có địa chỉ, hoặc ngược lại
+  const phoneNow = PHONE_TEXT_RE.test(cur.replace(/[\s.\-]/g, ""));
+  // Chỉ tính khi chính tin khách vừa nhắn có địa chỉ (verified.address là địa chỉ lấy từ cả lịch sử chat → lượt nào cũng đúng, làm bot hỏi lại SĐT dồn dập)
+  const addrNow = addressInTexts(currentTexts, verified?.address);
+  const hasPhone = !!String(mergedInfo?.phone || "").trim() || phoneNow;
+  const hasAddr = !!String(mergedInfo?.address || "").trim();
+  if (phoneNow && !hasAddr) out.add("dia chi");
+  if (addrNow && !hasPhone) out.add("so dien thoai");
+  // Chiều cao + cân nặng: xét các tin khách từ sau lần shop hỏi size ĐẦU TIÊN (gồm cả tin hiện tại)
+  const list = history || [];
+  const firstAsk = list.findIndex((m) => m.from !== "customer" && askedTopics(m.text || "").has("size"));
+  // Chỉ quần áo/giày... mới có cặp chiều cao + cân nặng (vòi nước, chậu... khách nói "cao 30cm", "5kg" là thông số khác)
+  if (bodySized && firstAsk >= 0) {
+    const before = list.slice(firstAsk + 1).filter((m) => m.from === "customer").map((m) => m.text || "");
+    const all = before.concat(currentTexts || []).join(" \n ");
+    const curH = HEIGHT_RE.test(cur), curW = WEIGHT_RE.test(cur);
+    const hasH = HEIGHT_RE.test(all), hasW = WEIGHT_RE.test(all);
+    if ((curH || curW) && !(hasH && hasW)) out.add("size");
+  }
+  return out;
+}
+
+const ADDRESS_UNIT_WORDS = new Set("phuong xa quan huyen tinh tp tx tt thon".split(" "));
+
 function verifyCustomerInfo(info, history, latestText) {
   const customerTexts = (history || []).filter((m) => m.from === "customer").map((m) => m.text || "");
   customerTexts.push(latestText || "");
   const blob = norm(customerTexts.join(" \n "));
+  const blobClean = blob.replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
+  const blobWords = new Set(blobClean.split(" ").filter(Boolean));
   const digits = customerTexts.join(" ").replace(/\D/g, "");
   const out = {};
   for (const k of ["name", "phone", "address", "variant"]) {
@@ -660,9 +919,13 @@ function verifyCustomerInfo(info, history, latestText) {
       if (d.length >= 9 && digits.includes(d.replace(/^84/, "0").replace(/^0/, ""))) out.phone = v;
       continue;
     }
-    const tokens = norm(v).split(/\s+/).filter(Boolean);
+    // Khách chỉ nói nơi ở ("Tp Cần Thơ") để hỏi ship → chưa phải địa chỉ nhận hàng, không lưu (nếu lưu, bot tưởng đã đủ địa chỉ)
+    if (k === "address" && isLocationOnlyText(v)) continue;
+    // Bỏ dấu câu ("4,", "TP.") và bỏ chữ đơn vị hành chính (phường, xã, tp, tỉnh...) vì AI hay viết đầy đủ còn khách viết tắt ("p", "tp")
+    let tokens = norm(v).replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+    if (k === "address") tokens = tokens.filter((tk) => !ADDRESS_UNIT_WORDS.has(tk));
     if (!tokens.length) continue;
-    const hit = tokens.filter((tk) => blob.includes(tk)).length;
+    const hit = tokens.filter((tk) => blobWords.has(tk) || (tk.length >= 3 && blobClean.includes(tk))).length;
     if (hit / tokens.length >= 0.6) out[k] = v;
   }
   return out;
@@ -827,15 +1090,62 @@ async function generateReply(senderId, customerMessage, customerImages, settings
     // Đơn khách đã đặt (để bot biết khách đặt từ ngày nào, đã bao nhiêu ngày) — lỗi thì bỏ qua
     listOrders(senderId).catch(() => []),
   ]);
-  const orderContext = buildOrderContext(customerOrders, settings.botPrompt);
+  // Đơn hệ thống TỰ TẠO khi khách để lại SĐT mà chủ shop chưa xác nhận thì chưa tính là khách đã đặt hàng (bot vẫn chat/hỏi thông tin như bình thường)
+  const orderContext = buildOrderContext(customerOrders.filter((o) => !isUnconfirmedAuto(o) && o.status !== "returned"), settings.botPrompt);
   // Các câu trả lời chuẩn chủ shop đã dạy ở trang "Dạy bot" (lỗi thì bỏ qua, không ảnh hưởng việc trả lời khách)
   const trainQueries = [customerMessage, ...pendingMsgs.map((m) => (m.text || "").trim()).filter(Boolean).slice(-4).reverse()];
-  // Tìm câu đã dạy và tải ảnh khách gửi (để AI nhìn) chạy song song
-  const [trainingText, contents] = await Promise.all([
-    getTrainingForPrompt(currentProduct?.id, trainQueries).catch(() => ""),
-    buildContents(history, customerMessage, customerImages),
+  // ---- Đoán tình huống & ngữ cảnh khách trước khi trả lời ----
+  // Lớp 2: nhãn tình huống bằng luật từ khoá (không tốn AI) → tìm câu đã dạy đúng nhóm hơn.
+  const ruleLabel = detectSituation(trainQueries);
+  // Lớp 3: AI phân loại riêng (model nhẹ, tối đa ~4,5s) — CHỈ khi tin dễ hiểu sai: phàn nàn, mặc cả, đổi trả, phân vân, tin quá ngắn, khách đã có đơn.
+  // Lỗi / timeout / không chắc → bỏ qua, bot chạy như cũ.
+  // Mặc định TẮT để tiết kiệm quota (mỗi tin tốn thêm 1-2 request). Bật lại bằng biến môi trường SITUATION_AI=1.
+  const classifyNow =
+    process.env.SITUATION_AI === "1" &&
+    !firstContact &&
+    shouldClassify({
+      customerMessage,
+      label: ruleLabel,
+      hasOrder: !!orderContext,
+      hasImages: customerImages.length > 0,
+      historyLen: history.length,
+    });
+  const situationPromise = classifyNow
+    ? classifySituation({
+        history,
+        customerMessage,
+        pendingTexts: pendingMsgs.map((m) => (m.text || "").trim()).filter(Boolean),
+        orderBrief: orderContext,
+        productName: currentProduct?.name || "",
+        keys: apiKeys,
+      }).catch(() => null)
+    : Promise.resolve(null);
+  const contentsPromise = buildContents(history, customerMessage, customerImages); // tải ảnh khách gửi chạy song song với lớp phân loại
+  const situation = await situationPromise;
+  if (classifyNow) console.log("---- Phân loại tình huống (lớp 3):", situation ? JSON.stringify(situation) : "(bỏ qua / lỗi)");
+  const aiLabelOk = !!situation && situation.do_chac !== "thap" && situation.nhom !== "khac" && situation.nhom !== "dong_y_ngan";
+  const situationLabel = aiLabelOk ? situation.nhom : ruleLabel;
+
+  // Tìm câu đã dạy (ưu tiên đúng nhóm tình huống) + lịch sử đã dựng
+  const ladderOn = hasLadder(currentProduct);
+  const [trainingText, contents, ownerPrices, ladderOutgoing] = await Promise.all([
+    getTrainingForPrompt(currentProduct?.id, trainQueries, { label: situationLabel, strong: aiLabelOk }).catch(() => ""),
+    contentsPromise,
+    getOwnerPriceTexts(senderId).catch(() => []),
+    ladderOn ? getOutgoingTexts(senderId, 80).catch(() => []) : Promise.resolve([]),
   ]);
+  if (ownerPrices.length) console.log("Chủ shop đã tự nhắn giá với khách:", ownerPrices.join(" | "));
   const systemPrompt = buildSystemPrompt(
+    formatProductsForPrompt(products),
+    settings.botPrompt,
+    currentProduct,
+    customerName,
+    customerInfo,
+    trainingText,
+    orderContext
+  );
+  // Bản GỌN cho AI dự phòng (Groq): prompt đầy đủ quá dài, Groq sẽ bị cắt mất phần giữa (mất luật chốt đơn)
+  const groqBasePrompt = buildCompactSystemPrompt(
     formatProductsForPrompt(products),
     settings.botPrompt,
     currentProduct,
@@ -854,7 +1164,8 @@ async function generateReply(senderId, customerMessage, customerImages, settings
         "\n\nKHÁCH VỪA NHẮN LIÊN TIẾP " + lines.length + " TIN (shop chưa trả lời tin nào):\n" +
         lines.map((l, i) => `${i + 1}. ${l}`).join("\n") +
         "\nHãy đọc HẾT các tin này rồi trả lời MỘT lần, gộp gọn: trả lời các câu khách hỏi, ghi nhận thông tin khách vừa đưa (SĐT, địa chỉ, tên...) " +
-        "và chỉ hỏi thêm đúng phần còn thiếu để lên đơn (tối đa 1 câu hỏi). Không trả lời từng tin một.";
+        "và chỉ hỏi thêm đúng phần còn thiếu để lên đơn (tối đa 1 câu hỏi). Không trả lời từng tin một. " +
+        "Sắp xếp các tin trả lời THEO ĐÚNG THỨ TỰ khách nhắn (tin nào khách nhắn trước thì trả lời trước, kể cả khi tin sau là câu hỏi).";
     }
   }
   // Khách nhắn thêm NGAY SAU tin bot vừa gửi (câu trước trả lời hơi sớm) → chỉ trả lời phần mới
@@ -868,32 +1179,115 @@ async function generateReply(senderId, customerMessage, customerImages, settings
         "Không lặp lại ý đã nói ở tin shop vừa gửi, không hỏi lại điều khách vừa trả lời (vd khách đã nói màu thì đừng hỏi màu nữa), không chào lại.";
     }
   }
-  // Shop vừa hỏi khách xin thông tin (màu, size, SĐT...) chưa quá "thời gian hỏi lại" → dặn AI chỉ trả lời, chưa hỏi lại
+  // ---- BẢNG THUỘC TÍNH của sản phẩm (Màu / Chiều dài / Size...): hệ thống TỰ đối chiếu cuộc chat xem khách đã chọn mục nào, còn thiếu mục nào ----
+  const attrs = productAttributes(currentProduct);
+  const attrMode = attrs.length > 0;
+  const attrCurrent = [String(customerMessage || ""), ...(pendingMsgs || []).map((m) => (typeof m === "string" ? m : m?.text || ""))].filter((t) => t.trim());
+  // Tin khách ở các lượt trước đã được AI dịch lại đúng chính tả (messages.text_norm) → luật đọc bản đó (xem lib/customerRewrite.js)
+  const attrHistory = ruleRows(history.filter((m) => !(m.from === "customer" && attrCurrent.includes(String(m.text || "")))));
+  // Các tin MỚI của khách lượt này: dặn AI viết lại đúng chính tả (trường khach_viet_lai) — id để lưu lại bản đã dịch
+  const rewriteTargets = (pendingMsgs || []).map((m) => ({ id: m?.id ?? null, text: String(typeof m === "string" ? m : m?.text || "") })).filter((t) => t.text.trim());
+  if (!rewriteTargets.length && String(customerMessage || "").trim()) rewriteTargets.push({ id: null, text: String(customerMessage) });
+  const rewriteNote = rewriteTurnNote(rewriteTargets.map((t) => t.text));
+  const attrBefore = attrMode ? attributeStatus(attrs, attrHistory, [], customerInfo?.variant) : null;
+  const attrNow = attrMode ? attributeStatus(attrs, attrHistory, attrCurrent, customerInfo?.variant) : null;
+  // Khách đang CÂN NHẮC / lo lắng chuyện khác ("để mình hỏi chồng đã", "lăn tăn chất lượng"...) → không ép chốt, không xin SĐT/địa chỉ
+  const hesitateNow = analyzeHesitation(attrCurrent);
+  if (hesitateNow.hesitating) console.log("Khách đang cân nhắc/lo lắng (" + hesitateNow.kind + "):", hesitateNow.quote);
+  const attrNote = attrMode ? attributeTurnNote(currentProduct, attrNow, { hold: hesitateNow.hesitating }) : "";
+  if (attrMode) console.log("---- Thuộc tính:", attrNow.list.map((x) => `${x.attr.name}=${x.state}${x.picked.length ? "(" + x.picked.join("+") + ")" : ""}${x.undecided?.length ? "(đang phân vân: " + x.undecided.join("/") + ")" : ""}`).join(" | "));
+
+  // BẢNG GIÁ MẶC CẢ: sản phẩm có bảng → HỆ THỐNG tính giá của lượt này (đồng ý / hạ nấc / giữ), bot chỉ nói đúng con số hệ thống đưa
+  let ladderCtx = null;
+  if (ladderOn) {
+    try {
+      ladderCtx = computePriceContext({
+        product: currentProduct,
+        outgoing: ladderOutgoing,
+        customerNow: attrCurrent,
+        customerRecent: attrHistory.filter((m) => m.from === "customer").map((m) => String(m.text || "")).reverse(),
+        lastShopText: (ladderOutgoing[ladderOutgoing.length - 1] || {}).text || "",
+        minQty: Math.max(attrMode ? colorCount(attrNow) : 0, qtyFromReplies([...attrHistory, ...[...attrCurrent].reverse().map((t) => ({ from: "customer", text: String(t || "") }))]) || 0),
+      });
+    } catch (e) {
+      console.error("Lỗi tính bảng giá mặc cả:", e.message);
+    }
+    if (ladderCtx) console.log("---- Bảng giá mặc cả:", JSON.stringify({ soLuong: ladderCtx.qty, thapNhatDaBao: ladderCtx.lowest, khachDeNghi: ladderCtx.offer, quyetDinh: ladderCtx.decision }));
+  }
+  const priceNote = ladderCtx ? priceTurnNote(ladderCtx) : "";
+  const dDays = parseDeliveryDays(settings?.botPrompt); // thời gian giao hàng chủ shop ghi trong "Thông tin shop" (vd 3-4 ngày)
+  // Số lượng khách tự nói ("lấy 2 cái") — dùng khi sản phẩm không có bảng giá mặc cả, để tin báo đơn không mặc định 1 cái
+  const qtyHintNow =
+    customerQtyHint([...attrCurrent].reverse().concat(attrHistory.filter((m) => m.from === "customer").map((m) => String(m.text || "")).reverse())) ||
+    qtyFromReplies([...attrHistory, ...[...attrCurrent].reverse().map((t) => ({ from: "customer", text: String(t || "") }))]);
+  let sumDetail = attrMode ? summaryDetail(attrNow, ladderCtx?.qty || qtyHintNow || 1) : null; // chi tiết ghép tin tóm tắt (size, chiều dài, từng màu x số lượng)
+  // Các tin của KHÁCH (mới nhất trước) để đọc xem khách tự xưng "chị" hay "anh"
+  const custTextNewest = () =>
+    [...currentTexts].reverse().concat((history || []).filter((m) => m.from === "customer").map((m) => m.text || "").reverse()).join("\n");
+  const ladderTone = (msgs) =>
+    pronounsFrom([...(msgs || [])].reverse().concat(ladderOutgoing.slice(-8).map((m) => m.text).reverse()).join("\n"), custTextNewest());
+
+  // Shop ĐÃ hỏi khách xin thông tin (màu, size, SĐT, địa chỉ...) rồi → dặn AI không hỏi lại; hỏi lại là việc của tin nhắn bồi
   let askNote = "";
+  const reaskNote = "";
   if (askGapMs > 0 && !firstContact) {
-    const { topics, ageMs } = recentAskedTopics(askRows, askGapMs);
+    const { topics } = recentAskedTopics(askRows, Infinity);
     if (topics.size) {
-      const secs = Math.max(1, Math.round((ageMs || 0) / 1000));
       askNote =
-        "\n\nLƯU Ý VỀ VIỆC HỎI LẠI: shop vừa hỏi khách xin [" + [...topics].join(", ") + "] cách đây khoảng " + secs + " giây. " +
-        "Nếu khách chưa trả lời phần đó thì lượt này CHỈ trả lời đúng điều khách vừa hỏi, KHÔNG hỏi lại và KHÔNG nhắc lại các thông tin này (hệ thống sẽ tự hỏi lại khi đủ thời gian). " +
-        "Vẫn được hỏi thông tin KHÁC mà shop chưa hỏi.";
+        "\n\nLƯU Ý VỀ VIỆC HỎI LẠI: shop ĐÃ hỏi khách xin [" + [...topics].join(", ") + "] ở các tin trước. " +
+        "Lượt này KHÔNG hỏi lại và KHÔNG nhắc lại các thông tin đó dù khách chưa trả lời (hệ thống sẽ tự nhắn bồi sau một lúc). " +
+        "Chỉ trả lời đúng điều khách vừa hỏi. Vẫn được hỏi thông tin KHÁC mà shop chưa hỏi, ví dụ khi đã có đủ màu và size thì xin số điện thoại và địa chỉ. " +
+        (attrMode
+          ? "NGOẠI LỆ — nếu khách vừa trả lời/đưa thông tin cho một mục trong TRẠNG THÁI THUỘC TÍNH thì lượt này ĐƯỢC hỏi mục kế tiếp còn thiếu (đúng theo cách chọn của mục đó) bằng 1 câu ngắn; cặp (số điện thoại + địa chỉ): khách vừa đưa MỘT trong hai thì PHẢI hỏi nốt phần còn lại (mới gửi SĐT → chỉ xin địa chỉ)"
+          : isBodySizedProduct(currentProduct)
+          ? "NGOẠI LỆ — cặp hỏi gộp (chiều cao + cân nặng) và (số điện thoại + địa chỉ): nếu khách vừa đưa MỘT trong hai thì lượt này PHẢI hỏi nốt phần còn lại bằng 1 câu ngắn (vd khách mới nói chiều cao → chỉ xin cân nặng; mới gửi SĐT → chỉ xin địa chỉ)"
+          : "NGOẠI LỆ — cặp (số điện thoại + địa chỉ): nếu khách vừa đưa MỘT trong hai thì lượt này PHẢI hỏi nốt phần còn lại bằng 1 câu ngắn (mới gửi SĐT → chỉ xin địa chỉ). Sản phẩm này KHÔNG tính size theo chiều cao/cân nặng nên TUYỆT ĐỐI không xin chiều cao cân nặng") +
+        " Không hỏi lại phần khách đã đưa.";
     }
   }
-  // Đã hỏi thông tin này từ trước (quá "thời gian hỏi lại") mà giờ cần hỏi lại → dặn AI hỏi NGẮN hơn và đổi cách nói
-  let reaskNote = "";
-  if (askGapMs > 0 && !firstContact) {
-    const waiting = recentAskedTopics(askRows, askGapMs).topics;
-    const older = [...recentAskedTopics(askRows, Infinity).topics].filter((t) => !waiting.has(t));
-    if (older.length) {
-      reaskNote =
-        "\n\nLƯU Ý KHI HỎI LẠI: trước đó shop đã hỏi khách xin [" + older.join(", ") + "]. " +
-        "Nếu lượt này cần hỏi lại phần nào khách chưa trả lời thì phải viết câu NGẮN GỌN HƠN và ĐỔI CÁCH DIỄN ĐẠT, nội dung vẫn tương tự, " +
-        "không chép lại câu cũ (vd cũ: \"Chị cho shop xin chiều cao và cân nặng để em chọn size vừa cho mình nha.\" → mới: \"Chị cho em xin chiều cao cân nặng nha?\"). " +
-        "Phần khách đã trả lời rồi thì không hỏi lại.";
+  // ---- Khách xin "ảnh mẫu" của váy/áo/quần = xin ảnh NGƯỜI MẪU MẶC (không phải ảnh màu sản phẩm) ----
+  const modelProduct = currentProduct || (products.length === 1 ? products[0] : null);
+  const modelAskText = attrCurrent.join(" ");
+  // Khách nhắc màu cụ thể ("ảnh mẫu màu đen") hoặc hỏi chung các màu → KHÔNG phải xin ảnh người mẫu, giữ cách gửi ảnh cũ
+  const modelKind =
+    !adminHandled && !customerImages.length && isApparelProduct(modelProduct) && !isCatalogQuestion(modelAskText) && !mentionsSpecificColor(modelAskText, modelProduct)
+      ? isModelPhotoQuestion(modelAskText)
+      : false;
+  // Khách nói "Ảnh 75cm" (xin xem ảnh váy dài 75cm) → hiểu là xin ảnh NGƯỜI MẪU MẶC đúng độ dài đó, KHÔNG phải hỏi về độ dài
+  const lengthAsk =
+    !adminHandled && !customerImages.length && isApparelProduct(modelProduct) && !isCatalogQuestion(modelAskText) ? lengthPhotoAsk(modelAskText) : "";
+  let modelPhotoAsk = modelKind === "explicit" || !!lengthAsk;
+  if (modelKind === "bare") {
+    // "ảnh mẫu" trơn: chỉ hiểu là xin ảnh người mẫu mặc khi khách vừa nói chiều cao, hoặc ảnh sản phẩm đã gửi cho khách rồi.
+    // Khách mới hỏi "cho xem ảnh mẫu" từ đầu → vẫn gửi ảnh sản phẩm như cũ.
+    const talkedHeight = history.slice(-8).some((m) => m.from === "customer" && HEIGHT_RE.test(String(m.text || "")));
+    let sentBefore = false;
+    if (!talkedHeight) {
+      const sentSet = await getSentImageUrls(senderId).catch(() => new Set());
+      const pool = [...(modelProduct?.sampleImages || []), ...(modelProduct?.realImages || []), ...(modelProduct?.catalogImages || [])];
+      sentBefore = pool.some((u) => sentSet.has(u));
     }
+    modelPhotoAsk = talkedHeight || sentBefore;
   }
-  const finalPrompt = systemPrompt + burstNote + followupNote + askNote + reaskNote;
+  const hasRealPhotos = (modelProduct?.realImages || []).filter(Boolean).length > 0;
+  let modelPhotoNote = "";
+  if (modelPhotoAsk) {
+    console.log("Khách xin ảnh NGƯỜI MẪU MẶC:", modelAskText.slice(0, 80), hasRealPhotos ? "(shop có ảnh thực tế)" : "(shop CHƯA có ảnh thực tế)");
+    modelPhotoNote = hasRealPhotos
+      ? "\n\nLƯU Ý VỀ ẢNH: khách đang xin xem ẢNH NGƯỜI MẪU MẶC / ẢNH THỰC TẾ (khách có thể gọi là \"ảnh mẫu\", \"hình thật\", \"ảnh thực tế\"), KHÔNG phải ảnh các màu. Đặt send_images với type \"real\" cho sản phẩm này. KHÔNG gửi ảnh màu, KHÔNG đặt send_catalog."
+      : "\n\nLƯU Ý VỀ ẢNH: khách đang xin xem ẢNH NGƯỜI MẪU MẶC / ẢNH THỰC TẾ (khách có thể gọi là \"ảnh mẫu\", \"hình thật\", \"ảnh thực tế\") nhưng shop CHƯA có ảnh này. " +
+        "KHÔNG đặt send_images, KHÔNG đặt send_catalog, KHÔNG hứa gửi ảnh (ảnh các màu không phải thứ khách cần). " +
+        "Nói thật, ngắn gọn là bên shop chưa có ảnh bạn mẫu mặc, rồi trả lời NGAY điều khách đang cần biết (độ dài/size theo chiều cao khách đã nói, theo dữ liệu sản phẩm). " +
+        "Không hỏi lại thông tin shop đã hỏi ở tin trước.";
+  }
+  // Hệ thống nhận ra khách đang LO LẮNG ở tin này (vd "Nhưng phải hợp với cân nặng nhé", "sợ không vừa") → ép AI chỉ trấn an, không thúc khách đổi lựa chọn
+  const worryProbe = [String(customerMessage || ""), ...pendingMsgs.map((m) => (m.text || "").trim())].join(" ");
+  const worryNote = isWorryText(worryProbe)
+    ? "\n\nKHÁCH ĐANG LO LẮNG ở tin này (hệ thống đã nhận ra): CHỈ trấn an 1-2 câu, đúng điều khách lo, bằng thông tin THẬT trong nội dung/ghi chú sản phẩm (vd \"size L vừa đến 75kg nên chị yên tâm nha\"). KHÔNG hỏi thêm màu/size/chiều dài/SĐT/địa chỉ. KHÔNG khuyên khách đổi giá trị khách đã chọn (khách đã chọn chiều dài nào thì tôn trọng, đừng nhắc lại gợi ý cũ). Không có thông tin thật thì nói sẽ hỏi lại shop, không bịa."
+    : "";
+  const promptNotes = situationNote(situation) + burstNote + followupNote + askNote + reaskNote + attrNote + hesitateNote(hesitateNow) + rewriteNote + worryNote + modelPhotoNote + ownerPriceNote(ownerPrices) + priceNote;
+  const finalPrompt = systemPrompt + promptNotes;
+  const groqPrompt = groqBasePrompt + promptNotes;
 
   // Không cho AI chạy quá lâu: hàm Vercel bị cắt ở 60s, phải chừa thời gian gửi tin cho khách
   const deadline = Math.min(Date.now() + REPLY_BUDGET_MS, hardDeadline);
@@ -905,21 +1299,64 @@ async function generateReply(senderId, customerMessage, customerImages, settings
     { maxOutputTokens: 4096, temperature: 0.8, thinkingConfig: { thinkingLevel: "low" } },
   ];
 
+  // Tin KHÓ (phân vân, lo lắng, mặc cả, đổi trả, phàn nàn, đang chốt đơn / đưa SĐT-địa chỉ) → thử model mạnh hơn trước (GEMINI_COMPLEX_MODEL, mặc định TẮT — mọi tin dùng gemini-3.5-flash-lite trước);
+  // tin dễ (hỏi size, giá, ship...) vẫn dùng model mặc định cho nhanh + đỡ tốn quota. Model mạnh lỗi/hết quota → tự rơi về model thường.
+  const lastBotTextNow = ([...history].reverse().find((m) => m.from !== "customer") || {}).text || "";
+  const complexTurn = isComplexTurn({
+    label: situationLabel,
+    worry: isWorryText(worryProbe),
+    gaveContact: attrCurrent.some((t) => PHONE_TEXT_RE.test(String(t).replace(/[\s.\-]/g, "")) || looksLikeAddress(t)),
+    botAskedContact: /địa chỉ|số điện thoại|sđt|so dien thoai|dia chi/i.test(String(lastBotTextNow)),
+  });
+  const turnModels = modelsForTurn(complexTurn);
+  if (turnModels) console.log(`Tin khó (nhãn: ${situationLabel}) → ưu tiên ${turnModels[0]}`);
+
   let raw = "";
   let usedModel = null;
+  let aiErrors = [];
   for (let i = 0; i < attempts.length && !raw.trim(); i++) {
-    const r = await callGemini(finalPrompt, contents, attempts[i], deadline, apiKeys);
+    const r = await callGemini(finalPrompt, contents, attempts[i], deadline, apiKeys, { groqSystem: groqPrompt, ...(turnModels ? { models: turnModels } : {}) });
     raw = r.text;
     usedModel = r.model;
+    aiErrors = r.errors || aiErrors;
+    if (String(usedModel || "").startsWith("claude:")) {
+      // Claude là API TRẢ PHÍ → báo chủ shop (30 phút/lần) để biết Gemini đang hỏng và bot đang tốn tiền Claude
+      console.warn("⚠ Câu trả lời này do AI DỰ PHÒNG Claude (trả phí) viết vì Gemini lỗi/hết hạn mức:", usedModel);
+      await reportError("ai_backup_claude", "Gemini lỗi/chậm → bot đang trả lời bằng Claude dự phòng (tốn tiền Claude)", {
+        "Các lỗi Gemini": aiErrors.join("\n"),
+        "Khách": senderId,
+        "Tin khách": customerMessage,
+      }, { gapMs: 30 * 60 * 1000 });
+    } else if (String(usedModel || "").startsWith("groq:")) {
+      console.warn("⚠ Câu trả lời này do AI DỰ PHÒNG Groq viết (Gemini lỗi/hết hạn mức) → kiểm tra key Gemini ở nút 🔑:", usedModel);
+      await reportError("ai_backup_groq", "Gemini lỗi/chậm → bot đang trả lời bằng Groq dự phòng", {
+        "Các lỗi Gemini": aiErrors.join("\n"),
+        "Khách": senderId,
+        "Tin khách": customerMessage,
+      }, { gapMs: 15 * 60 * 1000 });
+    }
     if (isErrorText(raw)) {
       console.warn("AI trả về câu báo lỗi, bỏ qua và thử lại:", raw);
       raw = "";
     }
   }
+  if (!raw.trim()) {
+    await reportError("ai_no_answer", "AI KHÔNG trả lời được (Gemini, Claude và Groq đều lỗi)", {
+      "Các lỗi": aiErrors.join("\n"),
+      "Khách": senderId,
+      "Page": pageId,
+      "Tin khách": customerMessage,
+    }, { gapMs: 5 * 60 * 1000 });
+  }
   console.log("---- Khách hỏi:", customerMessage);
   console.log(`---- Bot trả lời (${usedModel || "không có model nào trả lời"}):`, raw || "(không có nội dung)");
+  // AI chính (Gemini hoặc Claude dự phòng) đã trả lời → tin cậy quyết định "chưa có địa chỉ" của AI; chỉ Groq / không có AI mới dùng luật đoán rộng
+  const aiIsTrusted = !!usedModel && !String(usedModel).startsWith("groq:");
 
   const parsed = parseModelJson(raw);
+  if (parsed?.tinh_huong) console.log(`---- Tình huống AI tự ghi (nhãn luật: ${ruleLabel}):`, String(parsed.tinh_huong).slice(0, 300));
+  // AI ghi tình huống là hỏi giá/ship/chất vải/ảnh/phân vân (không nói khách đưa địa chỉ) → hệ thống không tự nhặt địa chỉ từ tin khách
+  const aiSaysNoAddress = aiSaysNotAddress(parsed?.tinh_huong);
 
   // Lấy danh sách tin từ JSON (chịu được vài kiểu trả về lệch chuẩn); không phải JSON thì coi cả đoạn là câu trả lời
   let list = [];
@@ -927,26 +1364,258 @@ async function generateReply(senderId, customerMessage, customerImages, settings
   else if (typeof parsed?.messages === "string") list = [parsed.messages];
   else if (typeof parsed?.reply === "string") list = [parsed.reply];
   else if (!parsed && raw.trim()) list = salvageMessages(raw);
-  let messages = list.map((m) => stripBotNotes(m).slice(0, 1900)).filter((m) => m && !isErrorText(m)).slice(0, 2);
+  // AI nhét chữ "send_images" vào danh sách tin (thay vì đặt đúng trường send_images) → bỏ chữ đó, nhưng vẫn hiểu là khách cần xem ảnh
+  const strayImages = list.some((m) => /^[\W_]*send_images\b/i.test(String(m || "")));
+  let messages = cleanReplyList(
+    list
+      .map((m) => stripBotNotes(m).slice(0, 1900))
+      .filter((m) => m && !isErrorText(m) && !isInternalToken(m))
+  );
   // Khách nhắn liền nhiều tin → gộp thành MỘT tin trả lời (không gửi 2 tin rời làm khách rối)
   if (burstNote && messages.length > 1) {
     const joined = messages.join("\n\n");
     if (joined.length <= 1900) messages = [joined];
   }
   const openingRequested = !!parsed?.use_opening_product;
+  // ---- AI DỊCH LẠI CHÍNH TẢ TIN KHÁCH → BÁO CHO HỆ THỐNG ----
+  // AI viết lại tin khách đúng chính tả / đúng dạng hệ thống hiểu ("M61" → "cao 1m61", "5ok" → "nặng 50kg"). Hệ thống kiểm tra (không cho bịa số),
+  // lưu vào messages.text_norm (nhắn bồi, tạo đơn... đọc từ đó) rồi tính lại trạng thái bằng bản đúng chính tả → không hỏi lại điều khách đã nói.
+  let attrCurrentRule = attrCurrent;
+  let rewrites = [];
+  try {
+    rewrites = pickRewrites(parsed, rewriteTargets);
+    if (rewrites.length) {
+      console.log("AI dịch lại chính tả khách:", rewrites.map((r) => `"${r.orig}" → "${r.norm}"`).join(" | "));
+      await Promise.all(rewrites.filter((r) => r.id).map((r) => setMessageNorm(r.id, r.norm).catch((e) => console.error("Lỗi lưu bản dịch chính tả (bỏ qua):", e.message))));
+      attrCurrentRule = applyRewritesToTexts(attrCurrent, rewrites, rewriteTargets);
+      if (attrMode && attrNow) {
+        Object.assign(attrNow, attributeStatus(attrs, attrHistory, attrCurrentRule, customerInfo?.variant));
+        console.log("---- Thuộc tính (sau khi dịch lại chính tả):", attrNow.list.map((x) => `${x.attr.name}=${x.state}${x.picked.length ? "(" + x.picked.join("+") + ")" : ""}`).join(" | "));
+      } else {
+        // Sản phẩm không có bảng thuộc tính: chỉ cần bỏ câu xin lại chiều cao / cân nặng khách đã đưa
+        const known = bodyInfoGiven([...ruleRows(history).filter((m) => m.from === "customer").slice(-6).map((m) => String(m.text || "")), ...attrCurrentRule]);
+        const ded = dropKnownBodyAsks(messages, known);
+        if (ded.dropped.length) {
+          console.log("Bỏ câu xin lại số đo khách đã đưa (theo bản dịch chính tả):", ded.dropped.join(" | "));
+          messages = ded.messages;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Lỗi dịch lại chính tả khách (bỏ qua):", e.message);
+  }
+  // ĐỐI CHIẾU: AI đã nói giá trị khách chọn (vd "size L") mà bộ nhận diện còn thấy "missing" (khách gõ lạ như "zai l")
+  // → ghi nhận vào trạng thái để khối đơn + đơn lưu không bị thiếu, và bot không hỏi lại cân nặng để chọn size.
+  if (attrMode && attrNow) {
+    const recentBot = (history || []).filter((m) => m.from !== "customer").slice(-3).map((m) => m.text || "");
+    const recentCust = [...attrHistory.filter((m) => m.from === "customer").slice(-4).map((m) => String(m.text || "")), ...attrCurrentRule];
+    const fixedAttrs = reconcileWithReply(attrNow, { replyTexts: [...recentBot, ...messages], customerTexts: recentCust });
+    if (fixedAttrs.length) {
+      sumDetail = summaryDetail(attrNow, ladderCtx?.qty || qtyHintNow || 1);
+      console.log("Đối chiếu tin AI: bổ sung lựa chọn khách mà bộ nhận diện bỏ sót:", fixedAttrs.map((f) => `${f.name}=${f.value}`).join(", "));
+    }
+    // ĐỐI CHIẾU SỐ ĐO: AI nhắc lại "chị cao 1m62 nặng 58kg" VÀ tin khách có đúng các con số đó, nhưng bộ nhận diện luật không hiểu cách khách viết
+    // (vd "M62 58kg") → ghi nhận khách ĐÃ đưa số đo (mục chiều dài/size suy ra từ số đo thành "đã đo") và bỏ câu xin lại chiều cao/cân nặng.
+    try {
+      const crossBody = crossCheckBody({ customerTexts: recentCust, replyTexts: messages });
+      const bodyFixed = applyCrossBody(attrNow, crossBody);
+      if (bodyFixed.length) console.log("Đối chiếu tin AI + tin khách: khách đã đưa", bodyFixed.join(", "), "mà bộ nhận diện bỏ sót → không hỏi lại");
+      const ded = dropKnownBodyAsks(messages, attrNow.body);
+      if (ded.dropped.length) {
+        console.log("Bỏ câu xin lại số đo khách đã đưa:", ded.dropped.join(" | "));
+        messages = ded.messages;
+      }
+    } catch (e) {
+      console.error("Lỗi đối chiếu số đo (bỏ qua):", e.message);
+    }
+  }
 
+  // ĐỌC ĐƠN = AI + HỆ THỐNG (không hỏi lại khách): AI ghi danh sách món (order_items) → hệ thống kiểm từng giá trị rồi đối chiếu với cách đọc bằng luật.
+  //   giống nhau → dùng | AI đọc được thêm điều luật bỏ sót → dùng bản AI | mâu thuẫn → dùng bản hệ thống + báo chủ shop | AI ghi sai → bỏ bản AI
+  let reading = null;
+  if (attrMode && attrNow) {
+    try {
+      const custTexts = [...attrHistory.filter((m) => m.from === "customer").map((m) => String(m.text || "")), ...[...attrCurrentRule].reverse()];
+      // Khách đã chốt danh sách món ở lượt trước và không nhắn gì đổi → vẫn dùng (AI lượt này thường không ghi lại)
+      let statusChanged = false;
+      let aiRaw = Array.isArray(parsed?.order_items) ? parsed.order_items : null;
+      const sysQty = Math.max(1, qtyHintNow || 0, colorCount(attrNow) || 0);
+      const shopTexts = (history || []).filter((m) => m.from !== "customer").slice(-10).map((m) => String(m.text || "")); // lời tư vấn size/chiều dài của shop cũng là căn cứ
+      reading = readOrder({ attrs, status: attrNow, aiRaw, customerTexts: custTexts, shopTexts, sysQty });
+      if (!reading.final && !attrNow.items) {
+        const saved = await getSavedItems(senderId);
+        const still = saved ? savedItemsStillValid(attrs, saved, custTexts) : null;
+        if (still && still.length >= 2 && !attrNow.items) {
+          const ch = applyItemsToStatus(attrs, attrNow, still, { mode: "multi" });
+          if (attrNow.items) statusChanged = true;
+          console.log("Dùng lại danh sách món đã lưu:", ch.join(", ") || "(không đổi)");
+        }
+      }
+      if (reading.final) {
+        const ch = applyItemsToStatus(attrs, attrNow, reading.final, { mode: reading.mode === "multi" ? "multi" : "fill" });
+        console.log(`Đọc đơn [${reading.verdict}] dùng bản AI:`, ch.join(", ") || "(không đổi)");
+        statusChanged = true;
+      }
+      if (statusChanged) {
+        if (attrNow.itemsRaw?.length >= 2 && ladderOn && ladderCtx) {
+          try {
+            ladderCtx = computePriceContext({
+              product: currentProduct,
+              outgoing: ladderOutgoing,
+              customerNow: attrCurrent,
+              customerRecent: attrHistory.filter((m) => m.from === "customer").map((m) => String(m.text || "")).reverse(),
+              lastShopText: (ladderOutgoing[ladderOutgoing.length - 1] || {}).text || "",
+              minQty: colorCount(attrNow),
+            });
+          } catch (e) {
+            console.error("Lỗi tính lại bảng giá sau khi đọc đơn:", e.message);
+          }
+        }
+        sumDetail = summaryDetail(attrNow, ladderCtx?.qty || qtyHintNow || 1);
+      } else if (reading.verdict !== "none") {
+        console.log(`Đọc đơn [${reading.verdict}]`, reading.notes.join("; "));
+      }
+      // Lưu danh sách món (nhiều món) để các lượt sau + đơn lưu dùng đúng; đổi sang 1 món thì xóa
+      if (attrNow.itemsRaw?.length >= 2) await saveItems(senderId, attrs, attrNow.itemsRaw, attrCurrent[0] || customerMessage);
+      else if (reading.verdict === "agree" || reading.verdict === "ai_filled" || reading.verdict === "conflict") await saveItems(senderId, attrs, null, "");
+      // Nhật ký + báo chủ shop khi mâu thuẫn
+      if (reading.verdict !== "none") {
+        await logReading({ conversationId: senderId, product: currentProduct?.name, attrs, reading, customerText: String(customerMessage || attrCurrent[0] || "") });
+        if (reading.verdict === "conflict") await alertConflict({ conversationId: senderId, name: await getCustomerName(senderId).catch(() => ""), attrs, reading });
+      }
+    } catch (e) {
+      console.error("Lỗi đọc đơn (AI + hệ thống) — bỏ qua, dùng cách đọc cũ:", e.message);
+    }
+  }
+
+  // Khách HẸN GỬI SAU ("mai chị gửi địa chỉ nha", "để chị gửi thông tin sau", "chưa có địa chỉ"...):
+  // bot chỉ đáp lịch sự, KHÔNG xin SĐT/địa chỉ nữa và KHÔNG lưu câu hẹn đó làm địa chỉ giao hàng.
+  const deferNow = analyzeDefer([String(customerMessage || ""), ...(pendingMsgs || []).map((m) => (typeof m === "string" ? m : m?.text || ""))]);
+  if (deferNow.defer) console.log("Khách hẹn gửi sau → không xin thông tin:", [...deferNow.topics].join(", "), "|", String(customerMessage || "").slice(0, 80));
   // Ghi nhớ thông tin khách vừa nói (tên, SĐT, địa chỉ, màu/size) — lần sau bot không hỏi lại
+  let verified = null;
   if (parsed?.customer_info && typeof parsed.customer_info === "object") {
-    const verified = verifyCustomerInfo(parsed.customer_info, history, customerMessage);
+    verified = verifyCustomerInfo(parsed.customer_info, history, customerMessage);
+    // Câu hẹn gửi sau không phải địa chỉ: bỏ địa chỉ AI tự điền nếu phần còn lại của tin không có địa chỉ thật
+    if (deferNow.defer && deferNow.topics.has("dia chi") && !deferNow.rest.some((t) => looksLikeAddressStrict(t))) {
+      delete verified.address;
+      parsed.customer_info = { ...parsed.customer_info, address: "" };
+    }
+    // Sản phẩm có bảng thuộc tính: màu/size/chiều dài do HỆ THỐNG ghép từ lựa chọn đã xác nhận, KHÔNG nhận chữ AI tự ghi (AI từng ghi cả chiều dài không có như 70cm)
+    if (attrMode) delete verified.variant;
     await mergeCustomerInfo(senderId, verified).catch((e) =>
       console.error("Không lưu được thông tin khách:", e.message)
     );
   }
 
+  // Sản phẩm có bảng thuộc tính: màu/size/chiều dài khách đã chọn do HỆ THỐNG ghép (đúng hơn chữ AI tự ghi) → lưu cho đơn hàng
+  if (attrMode) {
+    const composed = composeVariant(attrNow);
+    const savedVariant = String(customerInfo?.variant || "").trim();
+    if (composed && composed !== savedVariant) {
+      verified = { ...(verified || {}), variant: composed };
+      // composed thay hẳn bản đã lưu (xóa trước rồi ghi) để không sót giá trị cũ không còn hợp lệ
+      await mergeCustomerInfo(senderId, { variant: composed }, { clear: ["variant"] }).catch((e) => console.error("Không lưu được lựa chọn của khách:", e.message));
+    } else if (!composed && savedVariant) {
+      // Chưa có lựa chọn nào được xác nhận mà trong thông tin đã lưu vẫn còn giá trị lạ → chỉ giữ phần hợp lệ
+      const clean = sanitizeVariant(attrs, savedVariant);
+      if (clean !== savedVariant) {
+        await mergeCustomerInfo(senderId, clean ? { variant: clean } : {}, { clear: ["variant"] }).catch((e) => console.error("Không làm sạch được lựa chọn đã lưu:", e.message));
+        verified = { ...(verified || {}), variant: clean };
+      }
+    }
+  }
+  // Lưới an toàn: khách đã gửi địa chỉ (shop vừa xin SĐT/địa chỉ) mà AI không điền → tự lấy từ tin khách, để bot không hỏi lại / hỏi thêm "số nhà, đường phố"
+  if (!aiSaysNoAddress && !String(customerInfo?.address || "").trim() && !String(verified?.address || "").trim()) {
+    const histArr = history || [];
+    let askIdx = -1;
+    histArr.forEach((m, k) => {
+      if (m.from !== "customer" && /địa chỉ|dia chi|số điện thoại|sđt|so dien thoai|nhận hàng|nhan hang/i.test(String(m.text || ""))) askIdx = k;
+    });
+    if (askIdx >= 0) {
+      const sinceAsk = histArr.slice(askIdx + 1).filter((m) => m.from === "customer").map((m) => m.text || "");
+      const nowTexts = deferNow.defer
+        ? deferNow.rest // đã bỏ câu hẹn gửi sau → không nhận "mai chị gửi địa chỉ cty nha" làm địa chỉ
+        : [...(pendingMsgs || []).map((m) => (typeof m === "string" ? m : m?.text || "")), String(customerMessage || "")];
+      const addr = pickAddressFromTexts([...sinceAsk, ...nowTexts], { requireClearSignal: aiIsTrusted });
+      if (addr) {
+        verified = { ...(verified || {}), address: addr };
+        await mergeCustomerInfo(senderId, { address: addr }).catch((e) => console.error("Không lưu được địa chỉ tự lấy:", e.message));
+        console.log("AI không điền địa chỉ → hệ thống tự lấy từ tin khách:", addr);
+      }
+    }
+  }
+  // Tên + địa chỉ khách gõ → chỉnh chính tả trước khi dùng báo đơn / lưu đơn
+  if (verified) {
+    if (String(verified.address || "").trim()) verified = { ...verified, address: tidyAddress(verified.address) };
+    if (String(verified.name || "").trim()) verified = { ...verified, name: tidyName(verified.name) };
+  }
+  const mergedInfo = { ...(customerInfo || {}), ...Object.fromEntries(Object.entries(verified || {}).filter(([, v]) => String(v || "").trim())) };
+  // Khách VỪA gửi SĐT/địa chỉ ở lượt này → chuỗi chốt đơn thay hẳn câu nháp của AI
+  const replaceDraft = !!(verified && (String(verified.phone || "").trim() || String(verified.address || "").trim()));
+  const currentTexts = [String(customerMessage || ""), ...(pendingMsgs || []).map((m) => (typeof m === "string" ? m : m?.text || ""))].filter(Boolean);
+  // Có bảng thuộc tính: cặp chiều cao + cân nặng chỉ áp dụng khi mục "cặp" CHƯA chọn (khách đã nói "sz L" thì không hỏi nữa)
+  const bodySizedNow = attrMode ? attrNow.list.some((x) => x.attr.kind === "pair" && x.state === "missing") : isBodySizedProduct(currentProduct);
+  // Thông tin shop ĐÃ CÓ (SĐT, địa chỉ, tên) → câu bot xin lại đúng thông tin đó bị bỏ. Trừ khi khách đang nói về chính thông tin đó/đổi thông tin.
+  const customerTouchesInfo = /(địa chỉ|dia chi|sđt|sdt|số điện thoại|so dien thoai|đổi|mới|khác|sai|nhầm|sửa|thay)/i.test(currentTexts.join(" "));
+  const knownTopics = customerTouchesInfo
+    ? []
+    : [
+        String(mergedInfo.phone || "").trim() && "so dien thoai",
+        String(mergedInfo.address || "").trim() && "dia chi",
+        // Đã có SĐT + địa chỉ thì không xin họ tên (đơn không cần), trừ khi chủ shop ghi rõ trong "Thông tin shop" là cần tên người nhận
+        (String(mergedInfo.name || "").trim() || (String(mergedInfo.phone || "").trim() && String(mergedInfo.address || "").trim() && !/(họ tên|tên người nhận|tên nhận hàng)/i.test(String(settings?.botPrompt || "")))) && "ten nguoi nhan",
+        // Màu đã chốt → không hỏi lại màu. Mọi mục còn lại (size, chiều dài...) đã chốt hết → không hỏi lại chiều cao/cân nặng/size
+        attrMode && attrNow && attrNow.list.some((x) => /(^| )mau( |$)/.test(x.attr.key) && x.state === "chosen") && "mau",
+        attrMode && attrNow && (() => { const rest = attrNow.list.filter((x) => !/(^| )mau( |$)/.test(x.attr.key)); return rest.length > 0 && rest.every((x) => x.state === "chosen"); })() && "size",
+      ].filter(Boolean);
+  const unblockTopics = [
+    ...new Set([
+      ...[...partialPairTopics({ history, currentTexts, mergedInfo, verified, bodySized: bodySizedNow })].filter((t) => !deferNow.topics.has(t)),
+      // Khách vừa trả lời một mục → được hỏi mục kế tiếp (vd vừa chốt size L thì được hỏi chiều cao để chọn chiều dài)
+      ...(attrMode ? topicsToUnblock(attrNow, progressedBy(attrBefore, attrNow)) : []),
+    ]),
+  ];
+  // Khách VỪA đưa số điện thoại sau khi shop hỏi xin SĐT/địa chỉ → luôn phải có câu trả lời (hỏi nốt địa chỉ còn thiếu hoặc báo đã nhận thông tin),
+  // không được im lặng dù AI trả rỗng hoặc đánh dấu no_reply (SĐT đã được lưu sẵn nên AI hay tưởng khách chỉ lặp lại thông tin cũ).
+  const phoneNow = /(?:\+?84|0)\d{9}/.test(String(customerMessage || "").replace(/[\s.\-]/g, ""));
+  const lastBotText = ([...history].reverse().find((m) => m.from !== "customer") || {}).text || "";
+  const botAskedInfo = /địa chỉ|số điện thoại|sđt|so dien thoai|dia chi/i.test(String(lastBotText));
+  const mustReplyOrderInfo = phoneNow && botAskedInfo;
+  // Bảng giá: đã đủ SĐT + địa chỉ (và chọn đủ phân loại) → HỆ THỐNG ghép tin tóm tắt đơn đúng giá, bot không tự viết lại
+  let ladderReady = false;
+  let ladderSummary = "";
+  if (ladderCtx) {
+    ladderReady =
+      !!(String(mergedInfo.phone || "").trim() && String(mergedInfo.address || "").trim()) &&
+      (attrMode ? attrNow.list.every((x) => x.state === "chosen") : !productNeedsVariant(currentProduct) || !!String(mergedInfo.variant || "").trim());
+    if (ladderReady) {
+      const tone = ladderTone(messages);
+      const t = buildSummaryText({ product: currentProduct, ctx: ladderCtx, info: mergedInfo, kh: tone.kh, tu: tone.tu, detail: sumDetail, hintQty: qtyHintNow });
+      if (t && !summarySentBefore(t, ladderOutgoing.map((m) => m.text))) ladderSummary = t;
+    }
+  }
+  const orderInfoReply = () => {
+    const hasAddr = !!(customerInfo?.address || parsed?.customer_info?.address);
+    const neutral = notesForbidPronouns(currentProduct?.notes);
+    if (!hasAddr) return neutral ? "Shop xin địa chỉ nhận hàng nữa ạ?" : "Dạ mình cho shop xin địa chỉ nhận hàng nữa nhé ạ?";
+    return neutral ? "Shop đã nhận được thông tin, sẽ lên đơn và báo lại ạ." : "Dạ shop đã nhận được thông tin, sẽ lên đơn và báo lại mình nhé ạ.";
+  };
   // AI thấy tin khách chỉ lặp lại/xác nhận thông tin shop vừa chốt → không trả lời thêm (tránh "dạ em ghi nhận màu đen" lần nữa)
-  if (parsed?.no_reply === true && !messages.length && !parsed?.send_images && !parsed?.use_opening_product) {
+  if (!mustReplyOrderInfo && !ladderSummary && parsed?.no_reply === true && !messages.length && !parsed?.send_images && !parsed?.use_opening_product) {
     console.log("AI quyết định không trả lời (tin khách chỉ lặp lại thông tin đã chốt):", customerMessage);
-    return { skip: true };
+    return { skip: true, deliberate: true };
+  }
+  // Khách VỪA đưa số đo không có trong danh sách (vd chiều dài 70cm khi chỉ có 75/85/92cm): HỆ THỐNG tự hỏi xác nhận,
+  // không để AI tự chốt hay tự ghi nhận giá trị lạ. Chưa xin SĐT/địa chỉ, chưa lên đơn cho tới khi khách xác nhận một giá trị hợp lệ.
+  if (attrMode) {
+    const cf = confirmItems(attrNow).find((x) => x.fresh);
+    if (cf) {
+      const tone = ladderTone(messages);
+      const ask = buildConfirmAsk(cf, { kh: tone.kh, tu: tone.tu, neutral: notesForbidPronouns(currentProduct?.notes) });
+      console.log("Khách đưa giá trị ngoài danh sách → hệ thống hỏi xác nhận:", cf.attr.name, cf.pending?.raw, "→", cf.pending?.suggested);
+      return { messages: [ask], images: [], imageItems: [], imageNote: "", hasNotes: notesForbidPronouns(currentProduct?.notes), skipAskClean: true, unblockTopics: [], knownTopics: [], systemOrder: false };
+    }
   }
 
   // Model muốn dùng câu mở đầu quảng cáo (khách hỏi tương tự "giá bao nhiêu")
@@ -959,7 +1628,53 @@ async function generateReply(senderId, customerMessage, customerImages, settings
   let images = [];
   let imageItems = [];
   let imageNote = "";
-  const req = parsed?.send_images;
+  let req = parsed?.send_images;
+  let repeatInfo = null; // ảnh khách xin đã gửi rồi → không gửi lại, chỉ nói thông tin người mẫu
+  // CHỐT CHẶN: khách đang đưa SĐT/địa chỉ (chốt đơn) mà KHÔNG xin xem ảnh/hỏi màu mẫu → không gửi ảnh dù AI có yêu cầu
+  const msgText = String(customerMessage || "");
+  const askedForPhotos = /ảnh|hình|hinh|cho xem|xem (hàng|hang|mẫu|mau|màu|thử|thu)|feedback|video/i.test(msgText);
+  const phoneInMsg = /(?:\+?84|0)\d{9}/.test(msgText.replace(/[\s.\-]/g, ""));
+  const orderInfoNow = !!(
+    phoneInMsg ||
+    customerInfo?.phone ||
+    customerInfo?.address ||
+    parsed?.customer_info?.phone ||
+    parsed?.customer_info?.address
+  );
+  // CHỐT CHẶN 2: khách KHÔNG xin xem ảnh (không có chữ ảnh/hình/xem/video/feedback và không hỏi chung \"có mấy màu/mẫu nào\")
+  // mà AI lỡ yêu cầu gửi ảnh → bỏ yêu cầu ảnh, trả lời bằng chữ. Khách chỉ nhắc tên màu/mẫu (vd \"váy trắng\", \"màu đen có không\") cũng KHÔNG gửi ảnh.
+  // Xét cả các tin khách vừa nhắn liền nhau. Khách tự gửi ảnh cho bot thì vẫn cho gửi.
+  const allCurrent = currentTexts.join(" ");
+  const photoWord = /\b(anh|hinh|video|clip|xem|feedback|review)\b/.test(normKey(allCurrent));
+  // Khách TỰ GỬI ảnh: chỉ cho bot gửi ảnh lại khi khách HỎI về ảnh ("có mẫu này không", "giống cái này", "giá bao nhiêu", dấu ?).
+  // Ảnh trơn / "lấy màu này" (khách chụp màn hình ảnh của shop để chỉ màu mình chọn) → KHÔNG gửi lại ảnh, chỉ xác nhận bằng chữ.
+  const customerAsksAboutImage = /\?|giong|tuong tu|y chang|gia\b|bao nhieu|(?<![a-z])(?:co|con)(?![a-z])[^.!?]{0,30}(?<![a-z])(?:khong|ko|k|hong|ha)(?![a-z])/.test(normKey(allCurrent));
+  const unaskedImages = !photoWord && !isCatalogQuestion(allCurrent) && !adminHandled && (!customerImages.length || !customerAsksAboutImage);
+  const blockImages = (orderInfoNow && !askedForPhotos && !isCatalogQuestion(msgText)) || unaskedImages || (modelPhotoAsk && !hasRealPhotos);
+  if (blockImages) {
+    if (parsed?.send_images || strayImages || parsed?.send_catalog) console.log("Chặn gửi ảnh: khách không xin xem ảnh:", msgText.slice(0, 80));
+    req = null;
+  }
+  // AI muốn gửi ảnh nhưng ghi sai định dạng (thiếu product_id, hoặc chỉ viết chữ send_images) → dùng sản phẩm khách đang hỏi
+  if (!blockImages && !req?.product_id && (parsed?.send_images || strayImages)) {
+    const pid = currentProduct?.id || (products.length === 1 ? products[0].id : null);
+    req = pid ? { product_id: pid } : null;
+  }
+  // Khách xin ảnh người mẫu mặc mà shop có ảnh thực tế → chỉ gửi ảnh thực tế (không gửi ảnh màu)
+  if (modelPhotoAsk && hasRealPhotos && modelProduct) {
+    req = { product_id: modelProduct.id, type: "real" };
+    // Khách xin ảnh đúng 1 độ dài (vd 75cm): ảnh nào chủ shop đặt tên có chữ độ dài đó thì gửi đúng ảnh đó
+    if (lengthAsk) {
+      const labs = modelProduct.imageLabels || {};
+      const codes = [
+        ...(modelProduct.sampleImages || []).map((url, i) => ({ code: `S${i + 1}`, url })),
+        ...(modelProduct.realImages || []).map((url, i) => ({ code: `R${i + 1}`, url })),
+      ];
+      const want = " " + normKey(lengthAsk).replace(/cm$/, "") + " ";
+      const hit = codes.filter((x) => ` ${normKey(labs[x.url] || "").replace(/cm\b/g, "")} `.includes(want)).map((x) => x.code);
+      if (hit.length) req.image_ids = hit.slice(0, MAX_IMAGES);
+    }
+  }
   if (req?.product_id) {
     const p = products.find((x) => String(x.id) === String(req.product_id));
     if (p) {
@@ -990,6 +1705,17 @@ async function generateReply(senderId, customerMessage, customerImages, settings
       }
 
       picked = picked.slice(0, MAX_IMAGES);
+      // ẢNH ĐÃ GỬI RỒI (trong cuộc chat này) thì KHÔNG gửi lại, trừ khi khách xin xem lại. Thay vào đó nói thông tin bạn mẫu.
+      const wantsResend = /\b(gui lai|xem lai|lan nua|them lan nua)\b/.test(normKey(allCurrent));
+      if (!wantsResend && picked.length) {
+        const sentSet = await getSentImageUrls(senderId).catch(() => new Set());
+        const dropped = picked.filter((x) => sentSet.has(x.url));
+        if (dropped.length) {
+          picked = picked.filter((x) => !sentSet.has(x.url));
+          repeatInfo = { product: p, droppedReal: dropped.some((x) => x.code.startsWith("R")), allDropped: !picked.length };
+          console.log(`Không gửi lại ${dropped.length} ảnh đã gửi cho khách:`, dropped.map((x) => x.code).join(", "));
+        }
+      }
       images = picked.map((x) => x.url);
       imageItems = picked.map((x) => ({ url: x.url, title: x.label || p.name }));
       if (images.length) {
@@ -999,14 +1725,152 @@ async function generateReply(senderId, customerMessage, customerImages, settings
     }
   }
 
+  // Khách hỏi chung "có mấy màu / mẫu nào..." → gửi ẢNH TỔNG HỢP tất cả mẫu mã mà chủ shop đã chọn trong cài đặt sản phẩm.
+  // AI tự quyết (send_catalog) + có luật dự phòng theo từ khóa, vì AI hay chỉ trả lời chữ mà quên gửi ảnh.
+  if (!images.length) {
+    const cp =
+      (req?.product_id && products.find((x) => String(x.id) === String(req.product_id))) ||
+      currentProduct ||
+      (products.length === 1 ? products[0] : null);
+    const cat = catalogImageList(cp);
+    const wantCatalog = !blockImages && !modelPhotoAsk && (parsed?.send_catalog === true || isCatalogQuestion(customerMessage));
+    const sentRecently = history
+      .slice(-8)
+      .some((m) => m.from !== "customer" && String(m.text || "").includes("ảnh tổng hợp mẫu mã"));
+    if (cat.length && wantCatalog && !sentRecently) {
+      images = cat;
+      imageItems = cat.map((url) => ({ url, title: cp.name }));
+      imageNote = `📷 [Bot đã gửi ảnh tổng hợp mẫu mã của "${cp.name}"]`;
+      console.log("Gửi ảnh tổng hợp mẫu mã cho khách:", customerMessage);
+    }
+  }
+
+  // Khách chỉ gửi ảnh (chụp màn hình màu mình chọn...) mà không xin xem ảnh → không gửi ảnh lại, bỏ câu hứa "gửi ảnh"; không còn gì để nói thì xác nhận ngắn
+  if (unaskedImages && customerImages.length && !images.length && messages.length) {
+    const photoPromise = /(gửi|gui)[^,.!?\n]{0,40}(ảnh|hình|anh|hinh)|xem (ảnh|hình|anh|hinh)/i;
+    messages = messages
+      .map((m) => {
+        let out = String(m).split(/(?<=[,;.!?])\s*/).filter((c) => !photoPromise.test(c)).join(" ").trim().replace(/[,;]\s*$/, "");
+        if (out && !/[.!?]$/.test(out)) out += /ạ$/i.test(out) ? "." : " ạ.";
+        return out;
+      })
+      .filter(Boolean);
+    if (!messages.length) {
+      const colorPicked = attrMode ? (attrNow.list.find((x) => /(^| )mau( |$)/.test(x.attr.key))?.picked || []) : [];
+      const tn = ladderTone([]);
+      messages = [colorPicked.length ? `Dạ vâng, màu ${colorPicked.map((c) => String(c).toLowerCase()).join(", ")} nha ${tn.kh}.` : `Dạ em nhận được ảnh của ${tn.kh} rồi ạ.`];
+    }
+    console.log("Khách gửi ảnh mà không xin xem ảnh → không gửi ảnh lại:", messages.join(" | "));
+  }
+
+  // Khách xin ảnh người mẫu mặc mà shop CHƯA có → không gửi ảnh màu, bỏ câu hứa "gửi ảnh", nói thật là chưa có ảnh bạn mẫu
+  if (modelPhotoAsk && !hasRealPhotos && !images.length) {
+    const neutralNow = notesForbidPronouns(currentProduct?.notes);
+    const photoPromise = /(gửi|gui)[^,.!?\n]{0,40}(ảnh|hình|anh|hinh)|xem (ảnh|hình|anh|hinh)/i;
+    messages = messages
+      .map((m) => {
+        let out = String(m).split(/(?<=[,;.!?])\s*/).filter((c) => !photoPromise.test(c)).join(" ").trim().replace(/[,;]\s*$/, "");
+        if (out && !/[.!?]$/.test(out)) out += /ạ$/i.test(out) ? "." : " ạ.";
+        return out;
+      })
+      .filter(Boolean);
+    const saysNoPhoto = messages.some((m) => /(chưa|không|hiện chưa)[^.!?\n]{0,20}(ảnh|hình)/i.test(String(m)));
+    if (!saysNoPhoto) messages.unshift(neutralNow ? "Shop chưa có ảnh bạn mẫu mặc ạ." : "Dạ bên em chưa có ảnh bạn mẫu mặc ạ.");
+    messages = messages.slice(0, 2);
+  }
+
+  // Ảnh khách xin đã gửi rồi: bỏ câu hứa "gửi ảnh", nói thông tin bạn mẫu (ghi trong cài đặt sản phẩm) thay cho việc gửi lại ảnh
+  if (repeatInfo && repeatInfo.allDropped && !images.length) {
+    const neutralNow = notesForbidPronouns(currentProduct?.notes);
+    // Chỉ cắt đúng vế "em gửi chị xem ảnh...", giữ phần còn lại của câu (vd "chiều dài 75cm là ngắn nhất rồi")
+    const photoPromise = /(gửi|gui)[^,.!?\n]{0,40}(ảnh|hình|anh|hinh)|xem (ảnh|hình|anh|hinh)/i;
+    messages = messages
+      .map((m) => {
+        let out = String(m).split(/(?<=[,;.!?])\s*/).filter((c) => !photoPromise.test(c)).join(" ").trim().replace(/[,;]\s*$/, "");
+        if (out && !/[.!?]$/.test(out)) out += /ạ$/i.test(out) ? "." : " ạ.";
+        return out;
+      })
+      .filter(Boolean);
+    const info = String(repeatInfo.product?.modelInfo || "").trim();
+    const recentBot = history.filter((m) => m.from !== "customer").slice(-6).map((m) => norm(m.text || "")).join(" | ");
+    const aiMentionsModel = messages.some((m) => /(bạn mẫu|người mẫu|mẫu trong ảnh|mẫu mặc)/i.test(String(m)));
+    if (info && repeatInfo.droppedReal && !aiMentionsModel && !recentBot.includes(norm(info))) {
+      const line = /(bạn mẫu|người mẫu|mẫu )/i.test(info)
+        ? info
+        : neutralNow
+          ? `Bạn mẫu trong ảnh bên shop ${info} ạ.`
+          : `Dạ bạn mẫu trong ảnh bên em ${info} ạ.`;
+      messages.push(line.slice(0, 1900));
+    }
+    if (!messages.length) {
+      messages = [neutralNow ? "Ảnh thực tế shop đã gửi phía trên rồi ạ." : "Dạ ảnh thực tế bên em đã gửi phía trên rồi ạ, mình xem lại giúp em nhé."];
+    }
+    messages = messages.slice(0, 2);
+  }
+
+  // KIỂM TRA CUỐI: khách đã đưa số đo mà tin trả lời chưa nói giá trị (vd có chiều cao rồi nhưng chưa báo chiều dài váy)
+  // → nhờ AI viết lại 1 lần, bắt buộc nói giá trị đó (AI hay quên vì chỉ bị nhắc bằng lời).
+  if (attrMode && !images.length && hardDeadline - Date.now() > 14000) {
+    const due = measuredItems(attrNow).filter((x) => x.attr.values.length);
+    const said = messages.join(" ");
+    const lacking = due.filter((x) => !matchValues(x.attr, said).length);
+    // Các tin khách lượt này theo đúng thứ tự khách nhắn (cũ → mới), ưu tiên bản AI đã sửa chính tả ("4ok" → "40kg")
+    const customerSeq = rewriteTargets
+      .map((t) => {
+        const r = rewrites.find((x) => (x.id && t.id && String(x.id) === String(t.id)) || x.orig === t.text);
+        return String(r?.norm || t.text || "").trim();
+      })
+      .filter(Boolean);
+    const keepCustomerOrder = (list) => {
+      const ordered = orderByCustomerSequence(list, customerSeq);
+      if (ordered !== list) console.log("Sắp lại tin trả lời theo thứ tự khách nhắn:", customerSeq.join(" | "));
+      return ordered;
+    };
+    messages = keepCustomerOrder(messages);
+    // Các mục khác đã đủ + chưa có SĐT → sau khi tư vấn xong phải xin SĐT + địa chỉ NGAY trong lượt này (không chờ khách nhắn tiếp)
+    const askContact = !nextAttrToAsk(attrNow) && !String(mergedInfo?.phone || "").trim() && !deferNow.defer && !hesitateNow.hesitating;
+    if (lacking.length) {
+      console.log("Chưa tư vấn giá trị cho:", lacking.map((x) => x.attr.name).join(", "), "→ nhờ AI viết lại");
+      const redo = await retryForAdvice(finalPrompt, contents, deadline, apiKeys, hardDeadline, lacking, messages, askContact, groqPrompt, customerSeq);
+      const redoText = redo.join(" ");
+      if (redo.length && lacking.every((x) => matchValues(x.attr, redoText).length)) messages = keepCustomerOrder(redo);
+      else console.warn("Viết lại vẫn chưa có giá trị cần tư vấn → giữ tin cũ.");
+    }
+    // CHỐT CHẶN: đã tư vấn xong giá trị cuối mà tin trả lời chưa xin SĐT/địa chỉ → tự thêm câu xin
+    if (askContact && due.length && messages.length) {
+      const asked = askedTopics(messages.join(" "));
+      if (!asked.has("so dien thoai") && !asked.has("dia chi")) {
+        const pr = pronounsFrom(history.filter((m) => m.from !== "customer").slice(-6).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+        const neutralNow = notesForbidPronouns(currentProduct?.notes);
+        const ask = neutralNow
+          ? "Shop xin số điện thoại và địa chỉ nhận hàng để lên đơn nha ạ."
+          : `${pr.kh.charAt(0).toUpperCase() + pr.kh.slice(1)} cho ${pr.tu} xin số điện thoại và địa chỉ nhận hàng để ${pr.tu} lên đơn nha?`;
+        console.log("Đã tư vấn xong nhưng chưa xin SĐT/địa chỉ → thêm câu xin:", ask);
+        if (messages.length >= 2) messages = [...messages.slice(0, -1), `${String(messages[messages.length - 1]).replace(/\s+$/, "")} ${ask}`];
+        else messages = [...messages, ask];
+      }
+    }
+  }
+
+  if (ladderCtx && ladderSummary && !messages.length && !images.length) {
+    const tone = ladderTone([]);
+    const fin = finalizePriceReply({ product: currentProduct, ctx: ladderCtx, messages: [], info: mergedInfo, ready: true, sentBefore: ladderOutgoing.map((m) => m.text), kh: tone.kh, tu: tone.tu , detail: sumDetail, deliveryDays: dDays, replaceDraft, hintQty: qtyHintNow })
+    return { messages: fin.messages, images: [], imageItems: [], imageNote: "", hasNotes: notesForbidPronouns(currentProduct?.notes), skipAskClean: true, unblockTopics };
+  }
+  if (!messages.length && !images.length && mustReplyOrderInfo) {
+    return { messages: [orderInfoReply()], images: [], imageItems: [], imageNote: "", hasNotes: notesForbidPronouns(currentProduct?.notes), skipAskClean: true, unblockTopics };
+  }
   if (!messages.length) {
     // Model chỉ yêu cầu gửi ảnh mà quên viết câu dẫn → tự thêm 1 câu ngắn
-    if (images.length) messages = ["Dạ shop gửi anh/chị xem ảnh nhé ạ."];
+    if (images.length) {
+      // Sản phẩm có "Lưu ý của chủ shop" → câu dẫn không xưng hô anh/chị để không lệch với lưu ý
+      messages = [String(currentProduct?.notes || "").trim() ? "Shop gửi ảnh để xem thử nhé ạ." : "Dạ shop gửi mình xem ảnh nhé ạ."];
+    }
     else {
       // Trường hợp hay gặp: khách hỏi kiểu "giảm k", model đặt use_opening_product + messages rỗng,
       // nhưng câu mở đầu đã gửi rồi nên hệ thống không gửi lại → không còn gì để trả. Gọi lại AI, ép phải viết câu trả lời.
       console.warn("AI trả về messages rỗng.", { openingRequested, raw: (raw || "").slice(0, 300) });
-      const retried = await retryForcedText(finalPrompt, contents, deadline, apiKeys, hardDeadline);
+      const retried = await retryForcedText(finalPrompt, contents, deadline, apiKeys, hardDeadline, groqPrompt);
       if (retried.length) return { messages: retried, images: [], imageItems: [], imageNote: "" };
       // AI lỗi hẳn: im lặng, không gửi gì cho khách (chủ shop tự nhắn tay; khách nhắn tiếp thì bot thử lại bình thường)
       if (SILENT_ON_ERROR) {
@@ -1016,111 +1880,154 @@ async function generateReply(senderId, customerMessage, customerImages, settings
       return fallback;
     }
   }
-  return { messages, images, imageItems, imageNote };
-}
-
-/**
- * Gọi Gemini, thử lần lượt: mỗi model × mỗi API key (nhiều key = nhiều hạn mức/phút cộng lại).
- *  - 429 (hết quota key này) → thử NGAY key khác với cùng model đó (không đổi model vội, giữ chất lượng)
- *  - 404 (model không tồn tại) → bỏ hẳn model đó, sang model kế tiếp
- *  - 401/403 (key này sai/bị khoá) → bỏ hẳn key đó, thử key khác
- *  - 500/503/timeout (quá tải) → nghỉ ngắn rồi thử key khác của model đó
- *  - 400 do thinkingConfig (model không hỗ trợ) → gọi lại không kèm thinkingConfig
- * Trả về { text, model }; text rỗng nếu tất cả model + key đều lỗi.
- */
-async function callGemini(systemPrompt, contents, generationConfig, deadline, apiKeys) {
-  const keys = apiKeys && apiKeys.length ? apiKeys : [{ id: "__none__", key: "" }];
-
-  for (const model of MODEL_CHAIN) {
-    // Model vừa báo quá tải (503) → nhảy thẳng sang model kế tiếp; riêng model cuối luôn được thử
-    if ((modelDown.get(model) || 0) > Date.now() && model !== MODEL_CHAIN[MODEL_CHAIN.length - 1]) continue;
-
-    let config = generationConfig;
-    let stripped = false;
-
-    const now = Date.now();
-    let keyChain = keys.filter((k) => (modelCooldown.get(`${model}::${k.id}`) || 0) <= now);
-    if (!keyChain.length) keyChain = keys; // toàn bộ key đang "nghỉ" với model này thì thử lại hết
-
-    for (const keyObj of keyChain) {
-      const cooldownKey = `${model}::${keyObj.id}`;
-      const remaining = deadline - Date.now();
-      if (remaining < 3000) {
-        console.warn("Hết thời gian dành cho AI, dừng thử.");
-        return { text: "", model: null };
+  // Sản phẩm KHÔNG có bảng giá mặc cả (hoặc chưa tính được giá): khách vừa gửi nốt SĐT/địa chỉ → HỆ THỐNG tự gửi tóm tắt đơn (không tin vào việc AI tự tóm tắt)
+  let basicSent = false;
+  if (!ladderCtx?.dealTotal && botAskedInfo && !images.length) {
+    const readyBasic =
+      !!(String(mergedInfo.phone || "").trim() && String(mergedInfo.address || "").trim()) &&
+      (attrMode ? attrNow.list.every((x) => x.state === "chosen") : !productNeedsVariant(currentProduct) || !!String(mergedInfo.variant || "").trim());
+    if (readyBasic) {
+      const toneB = pronounsFrom((history || []).filter((m) => m.from !== "customer").slice(-8).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+      const botTexts = (history || []).filter((m) => m.from !== "customer").map((m) => m.text || "");
+      const orderB = buildOrderMessages({ product: currentProduct, ctx: ladderCtx, info: mergedInfo, kh: toneB.kh, tu: toneB.tu, noPrice: true, detail: sumDetail, sentBefore: botTexts, deliveryDays: dDays, hintQty: qtyHintNow });
+      // Đơn chỉ khác chút xíu, khách không đưa SĐT/địa chỉ mới và AI đã có câu trả lời thật → giữ câu của AI, không chèn tin mẫu "cập nhật đơn"
+      const keepAiReplyB = !!(orderB && orderB.ackOnly && !replaceDraft && (messages || []).length);
+      if (orderB && !keepAiReplyB && !summarySentBefore(orderB.block, botTexts)) {
+        console.log("Đủ thông tin đơn → hệ thống gửi chuỗi chốt đơn (không có bảng giá).");
+        messages = orderB.specChanged && !replaceDraft && (messages || []).length ? [messages[0], ...orderB.messages] : orderB.messages;
+        basicSent = true;
       }
-
-      let res;
-      try {
-        res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-goog-api-key": keyObj.key || "" },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: systemPrompt }] },
-            contents,
-            generationConfig: config,
-          }),
-          signal: AbortSignal.timeout(Math.min(GEMINI_TIMEOUT_MS, remaining)),
-        });
-      } catch (e) {
-        console.error(`Gemini ${model} (key ${keyObj.id}) timeout/lỗi mạng:`, e.message);
-        modelCooldown.set(cooldownKey, Date.now() + 20 * 1000);
-        continue; // thử key khác cùng model
-      }
-
-      const data = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        const err = data.error || {};
-        console.error(`Lỗi Gemini API [${model}] (key ${keyObj.id}) HTTP ${res.status}:`, JSON.stringify(err));
-
-        if (res.status === 401 || res.status === 403) {
-          // Key này sai/bị khoá — nghỉ lâu, thử key khác
-          modelCooldown.set(cooldownKey, Date.now() + 30 * 60 * 1000);
-          continue;
-        }
-        if (res.status === 400 && config.thinkingConfig && !stripped && /think/i.test(err.message || "")) {
-          const { thinkingConfig, ...rest } = config; // model này không nhận thinkingConfig
-          config = rest;
-          stripped = true;
-          continue; // thử lại đúng key này với cấu hình mới, không tính là lỗi
-        }
-        if (res.status === 404) {
-          // Tên model sai/đã tắt — không liên quan tới key, nghỉ hẳn model này rồi sang model kế tiếp
-          for (const k of keys) modelCooldown.set(`${model}::${k.id}`, Date.now() + 30 * 60 * 1000);
-          break;
-        }
-        if (res.status === 429) {
-          modelCooldown.set(cooldownKey, Date.now() + 60 * 1000); // key này hết hạn mức/phút → nghỉ 1 phút, thử key khác
-          continue;
-        }
-        if (res.status === 503) {
-          // "Model đang quá tải" là lỗi của CẢ model (đổi key không giúp) → nghỉ model này 45s, sang model kế tiếp ngay
-          modelDown.set(model, Date.now() + 45 * 1000);
-          break;
-        }
-        if (res.status >= 500) {
-          modelCooldown.set(cooldownKey, Date.now() + 15 * 1000);
-          continue; // lỗi máy chủ khác → thử key khác
-        }
-        continue; // 400 khác → thử key khác của model này
-      }
-
-      const cand = data.candidates?.[0];
-      const text = cand?.content?.parts?.map((p) => p.text || "").join("") || "";
-      if (text.trim()) return { text, model };
-
-      console.warn(
-        `Gemini ${model} (key ${keyObj.id}) không trả nội dung. finishReason=${cand?.finishReason} promptFeedback=${JSON.stringify(data.promptFeedback || null)}`
-      );
-      break; // rỗng → thử model kế tiếp (không phải lỗi key, đổi key không ích gì)
     }
   }
-  return { text: "", model: null };
+  let ladderSent = false;
+  if (ladderCtx) {
+    const tone = ladderTone(messages);
+    const fin = finalizePriceReply({ product: currentProduct, ctx: ladderCtx, messages, info: mergedInfo, ready: ladderReady, sentBefore: ladderOutgoing.map((m) => m.text), kh: tone.kh, tu: tone.tu, detail: sumDetail, deliveryDays: dDays, replaceDraft, hintQty: qtyHintNow });
+    if (fin.scrubbed) console.warn("Bot lỡ nói giá thấp hơn mức shop chấp nhận → đã cắt câu đó. Tin gốc:", messages.join(" | "));
+    messages = fin.messages;
+    ladderSent = !!fin.summary;
+  }
+  // CHỐT CHẶN: khách VỪA gửi SĐT/địa chỉ (hoặc đang bảo "kiểm tra") mà tin trả lời không có khối đơn nào
+  // (điều kiện ghép đơn chưa đủ, hoặc đơn trùng đã gửi trước đó) → hệ thống ghép khối đơn từ thông tin đã lưu và gửi, không để khách nhận câu trả lời trống.
+  let forcedSummary = false;
+  {
+    const saysCheck = (messages || []).some((m) => mentionsOrderCheck(m));
+    const hasBlock = (messages || []).some((m) => /SĐT:?\s*[\d .]{9,}/.test(String(m)));
+    const haveContact = !!(String(mergedInfo.phone || "").trim() && String(mergedInfo.address || "").trim());
+    const custAskCheck = mentionsOrderCheck(customerMessage) || /đơn đâu|đâu rồi/i.test(String(customerMessage || ""));
+    const gaveContactNow = phoneNow || replaceDraft;
+    // Còn thiếu màu / size / chiều dài (chưa chốt) thì KHÔNG tự ghép tin báo đơn khi khách vừa gửi SĐT/địa chỉ — để AI tư vấn/hỏi nốt phần thiếu trước
+    const attrsOk = !attrMode || attributesComplete(attrNow);
+    if (!attrsOk && !hasBlock && haveContact && gaveContactNow && !saysCheck && !custAskCheck) console.log("Còn thiếu thuộc tính chưa chốt → không tự ghép tin báo đơn:", attrNow.list.filter((x) => x.state !== "chosen").map((x) => `${x.attr.name}:${x.state}`).join(", "));
+    if (haveContact && !hasBlock && !images.length && (saysCheck || custAskCheck || (gaveContactNow && attrsOk))) {
+      const tone = ladderTone(messages);
+      const sentTexts = (history || []).filter((m) => m.from !== "customer").map((m) => m.text || "");
+      const askedCheck = saysCheck || custAskCheck;
+      const forced = buildOrderMessages({ product: currentProduct, ctx: ladderCtx, info: mergedInfo, kh: tone.kh, tu: tone.tu, noPrice: !ladderCtx?.dealTotal, detail: sumDetail, sentBefore: askedCheck ? [] : sentTexts, deliveryDays: dDays, hintQty: qtyHintNow });
+      if (forced) {
+        messages = askedCheck ? [`Dạ ${tone.tu} gửi lại đơn để ${tone.kh} kiểm tra giúp ${tone.tu} nhé:\n${forced.block}`] : forced.messages;
+        forcedSummary = true;
+        console.log("Thiếu khối đơn sau khi khách đưa SĐT/địa chỉ → hệ thống ghép khối đơn.", { gaveContactNow, askedCheck });
+      }
+    }
+  }
+  // CHỐT CHẶN: khách VỪA đưa đúng MỘT nửa của cặp (địa chỉ hoặc SĐT) mà AI quên xin nửa còn lại
+  // (hay gặp: AI chỉ viết "dạ em nhận được thông tin rồi ạ" theo câu ví dụ trong luật chốt đơn) → hệ thống tự thêm câu xin phần còn thiếu.
+  let contactAskAdded = false;
+  if (!forcedSummary && !ladderSent && !basicSent && !images.length && (messages || []).length && !deferNow.defer && !hesitateNow.hesitating) {
+    const trChat = pronounsFrom(history.filter((m) => m.from !== "customer").slice(-6).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+    const fix = missingContactAsk({
+      messages,
+      gaveAddress: addressInTexts(currentTexts, verified?.address, { requireClearSignal: aiIsTrusted, ruleOff: aiSaysNoAddress }), // chỉ xét tin khách VỪA nhắn (không xét lịch sử) — câu này làm hệ thống tự gửi tin cho khách
+      gavePhone: phoneNow || phoneInTexts(currentTexts),
+      havePhone: !!String(mergedInfo.phone || "").trim(),
+      haveAddress: !!String(mergedInfo.address || "").trim(),
+      kh: trChat.kh,
+      tu: trChat.tu,
+      neutral: notesForbidPronouns(currentProduct?.notes),
+    });
+    if (fix) {
+      console.log(`Khách mới đưa ${fix.need === "phone" ? "địa chỉ" : "SĐT"} mà AI quên xin ${fix.need === "phone" ? "SĐT" : "địa chỉ"} → hệ thống thêm câu xin:`, fix.ask);
+      messages = fix.messages;
+      contactAskAdded = true;
+    }
+  }
+  // Khách hẹn gửi sau: giữ câu đáp lịch sự của AI, bỏ mọi câu xin lại SĐT/địa chỉ; AI chỉ toàn câu xin → thay bằng 1 câu đáp ngắn
+  if (deferNow.defer && !forcedSummary && !ladderSent && !basicSent && !images.length) {
+    const before = messages;
+    messages = dropAsksForDeferred(messages, deferNow.topics);
+    if (!messages.length) {
+      const trD = pronounsFrom(history.filter((m) => m.from !== "customer").slice(-6).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+      messages = [notesForbidPronouns(currentProduct?.notes) ? "Dạ vâng ạ, khi nào tiện mình gửi shop nhé ạ." : `Dạ vâng ạ, khi nào tiện ${trD.kh} gửi ${trD.tu} nhé ạ.`];
+    }
+    if (before.join("|") !== messages.join("|")) console.log("Khách hẹn gửi sau → bỏ câu xin thông tin:", before.join(" | "), "→", messages.join(" | "));
+  }
+  // Khách đang CÂN NHẮC / lo lắng: bỏ câu xin SĐT/địa chỉ và câu ép chốt/thúc giục của AI (giữ phần đáp + giải đáp)
+  if (hesitateNow.hesitating && !deferNow.defer && !forcedSummary && !ladderSent && !basicSent && !images.length && (messages || []).length) {
+    const before = messages;
+    messages = dropAsksForDeferred(messages, new Set(["so dien thoai", "dia chi"]));
+    messages = dropPushyClose(messages).messages;
+    if (!messages.length) {
+      const trH = pronounsFrom(history.filter((m) => m.from !== "customer").slice(-6).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+      messages = [notesForbidPronouns(currentProduct?.notes) ? "Dạ vâng ạ, mình cứ thong thả cân nhắc, cần shop tư vấn thêm thì nhắn shop nhé ạ." : `Dạ vâng ạ, ${trH.kh} cứ thong thả cân nhắc, cần ${trH.tu} tư vấn thêm thì nhắn ${trH.tu} nhé ạ.`];
+    }
+    if (before.join("|") !== messages.join("|")) console.log("Khách đang cân nhắc → bỏ câu xin thông tin/ép chốt:", before.join(" | "), "→", messages.join(" | "));
+  }
+  // CHỐT CHẶN: khách đang PHÂN VÂN giữa các màu/size ("phân vân giữa màu kem và trắng") mà AI vẫn viết câu ép chọn
+  // ("chị lấy cả hai màu hoặc chọn một trong hai màu giúp em nha") → bỏ câu ép, giữ phần tư vấn.
+  if (attrMode && !forcedSummary && !ladderSent && !basicSent && !images.length && (messages || []).length) {
+    const trU = pronounsFrom(history.filter((m) => m.from !== "customer").slice(-6).map((m) => m.text || "").reverse().join("\n"), custTextNewest());
+    const soft = softenPushyChoice(messages, attrNow, { kh: trU.kh, tu: trU.tu, neutral: notesForbidPronouns(currentProduct?.notes) });
+    if (soft.changed) {
+      console.log("Khách đang phân vân → bỏ câu ép chọn của AI:", messages.join(" | "), "→", soft.messages.join(" | "));
+      messages = soft.messages;
+    }
+  }
+  return { messages, images, imageItems, imageNote, hasNotes: notesForbidPronouns(currentProduct?.notes), skipAskClean: deferNow.defer || ladderSent || basicSent || forcedSummary || contactAskAdded || !!(parsed?.customer_info && (String(parsed.customer_info.phone || "").trim() || String(parsed.customer_info.address || "").trim())), unblockTopics, knownTopics, systemOrder: ladderSent || basicSent || forcedSummary };
+}
+
+/** Nhờ AI viết lại tin trả lời, bắt buộc nói giá trị (chiều dài, size...) mà khách đã đưa đủ số đo nhưng tin nháp chưa nói. */
+async function retryForAdvice(systemPrompt, contents, deadline, apiKeys, hardDeadline, items, draftMessages, askContact = false, groqPrompt = "", customerTexts = []) {
+  try {
+    const orderedTexts = (customerTexts || []).map((t) => String(t || "").trim()).filter(Boolean).slice(-8);
+    const need = items
+      .map((x) => `- ${x.attr.name}: chọn đúng 1 giá trị trong [${x.attr.values.join(" / ")}]; cách chọn của chủ shop: ${x.attr.how || "theo số đo khách đã nói"}`)
+      .join("\n");
+    const extra =
+      "\n\nLƯU Ý BẮT BUỘC: khách đã đưa số đo nhưng tin trả lời nháp CHƯA nói giá trị của các mục sau:\n" + need +
+      "\nTin nháp: " + JSON.stringify(draftMessages) +
+      (orderedTexts.length >= 2
+        ? "\nCác tin khách vừa nhắn, THEO ĐÚNG THỨ TỰ (cũ → mới): " + JSON.stringify(orderedTexts) +
+          "\nBẮT BUỘC sắp xếp tin trả lời THEO ĐÚNG THỨ TỰ KHÁCH NÓI: thông tin / câu hỏi khách nhắn trước thì trả lời trước " +
+          "(vd khách nói cân nặng trước rồi mới hỏi chiều cao → nói size theo cân nặng TRƯỚC, rồi mới nói chiều dài váy theo chiều cao). " +
+          "Không đảo thứ tự, không dồn phần còn thiếu xuống cuối."
+        : "") +
+      "\nHãy viết lại 1-2 tin: vẫn trả lời các tin vừa rồi của khách, và phải nói rõ MỘT giá trị cụ thể cho mỗi mục trên, dựa đúng số đo khách đã nói " +
+      '(vd "chị cao 1m48 thì chân váy dài 75cm là vừa đẹp ạ"). ' +
+      (askContact
+        ? 'Các mục khác khách đã chọn đủ → sau khi nói giá trị, tin CUỐI phải xin luôn số điện thoại và địa chỉ nhận hàng (1 câu ngắn, vd "chị cho em xin số điện thoại và địa chỉ nhận hàng để em lên đơn nha"), KHÔNG hỏi "chọn được mẫu ưng ý chưa". '
+        : 'Chưa xin số điện thoại/địa chỉ. ') +
+      'Không hỏi lại số đo đã có. Giữ nguyên xưng hô và các luật khác.';
+    const { text: raw, model } = await callGemini(
+      systemPrompt + extra,
+      contents,
+      { maxOutputTokens: 2048, temperature: 0.6, responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "low" } },
+      Math.min(Math.max(deadline, Date.now() + 12000), hardDeadline),
+      apiKeys,
+      groqPrompt ? { groqSystem: groqPrompt + extra } : {}
+    );
+    console.log(`---- Bot trả lời (viết lại để tư vấn, ${model || "lỗi"}):`, raw || "(không có nội dung)");
+    const parsed = parseModelJson(raw);
+    const list = Array.isArray(parsed?.messages) ? parsed.messages : parsed?.reply ? [parsed.reply] : [];
+    return cleanReplyList(list.map((m) => stripBotNotes(m).slice(0, 1900)).filter((m) => m && !isErrorText(m) && !isInternalToken(m)));
+  } catch (e) {
+    console.error("Lỗi viết lại để tư vấn:", e.message);
+    return [];
+  }
 }
 
 /** Gọi lại Gemini lần nữa, nhắc bắt buộc phải có câu trả lời bằng chữ (không được để messages rỗng). */
-async function retryForcedText(systemPrompt, contents, deadline, apiKeys, hardDeadline = Date.now() + 50000) {
+async function retryForcedText(systemPrompt, contents, deadline, apiKeys, hardDeadline = Date.now() + 50000, groqPrompt = "") {
   try {
     const extra =
       "\n\nLƯU Ý BẮT BUỘC: mảng messages KHÔNG được rỗng. Câu mở đầu quảng cáo đã gửi rồi nên use_opening_product phải là null. " +
@@ -1135,12 +2042,13 @@ async function retryForcedText(systemPrompt, contents, deadline, apiKeys, hardDe
         thinkingConfig: { thinkingLevel: "low" },
       },
       Math.min(Math.max(deadline, Date.now() + 15000), hardDeadline), // chừa tới 15s cho lần thử lại, nhưng không vượt giới hạn 60s của Vercel
-      apiKeys
+      apiKeys,
+      groqPrompt ? { groqSystem: groqPrompt + extra } : {}
     );
     console.log(`---- Bot trả lời (thử lại, ${model || "lỗi"}):`, raw || "(không có nội dung)");
     const parsed = parseModelJson(raw);
     const list = Array.isArray(parsed?.messages) ? parsed.messages : parsed?.reply ? [parsed.reply] : [];
-    return list.map((m) => stripBotNotes(m)).filter((m) => m && !isErrorText(m)).slice(0, 2);
+    return cleanReplyList(list.map((m) => stripBotNotes(m)).filter((m) => m && !isErrorText(m)));
   } catch (e) {
     console.error("Lỗi thử lại Gemini:", e.message);
     return [];
@@ -1173,6 +2081,18 @@ async function persistCustomerImages(senderId, urls) {
 
 // ---- Gửi qua Facebook Send API ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Tin khách chỉ có tin thoại/video/file/vị trí → dòng ghi chú để AI biết (sticker/like thì bỏ qua như cũ). */
+function nonTextAttachmentNote(atts) {
+  for (const a of atts || []) {
+    if (a?.payload?.sticker_id) continue;
+    if (a?.type === "audio") return "[Khách gửi tin nhắn thoại]";
+    if (a?.type === "video") return "[Khách gửi video]";
+    if (a?.type === "file") return "[Khách gửi một tệp]";
+    if (a?.type === "location") return "[Khách gửi vị trí]";
+  }
+  return "";
+}
 const FB_URL = (token) => `https://graph.facebook.com/v21.0/me/messages?access_token=${token}`;
 
 async function fbPost(payload, token) {
@@ -1184,6 +2104,15 @@ async function fbPost(payload, token) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     console.error("Facebook từ chối:", JSON.stringify(err.error || err));
+    if (!payload.sender_action) {
+      const fe = err.error || {};
+      await reportError(`fb_send_${fe.code ?? res.status}`, "Facebook từ chối gửi tin cho khách", {
+        "Mã lỗi Facebook": `${fe.code ?? res.status}${fe.error_subcode ? "/" + fe.error_subcode : ""}`,
+        "Nội dung": fe.message || JSON.stringify(err),
+        "Khách": payload.recipient?.id,
+        "Gợi ý": fe.code === 190 ? "Token Page hết hạn/bị đổi → lấy token mới và cập nhật lại." : fe.code === 10 || fe.code === 551 || fe.error_subcode === 2018278 ? "Có thể khách nhắn đã quá 24 giờ hoặc đã chặn Page — thường không phải lỗi bot." : "",
+      }, { gapMs: 30 * 60 * 1000 });
+    }
     return false;
   }
   return true;
@@ -1196,7 +2125,7 @@ async function fbAction(recipientId, action, token) {
 async function sendMessage(recipientId, text, token) {
   return await fbPost({
     recipient: { id: recipientId },
-    message: { text },
+    message: { text: fixGluedSize(text) },
     messaging_type: "RESPONSE",
   }, token);
 }

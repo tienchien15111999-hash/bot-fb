@@ -2,9 +2,11 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { listOrders, listAllOrders, saveOrder, deleteOrder, setOrderStatus, getOrderPageId } from "@/lib/orders";
+import { listOrders, listAllOrders, saveOrder, deleteOrder, setOrderStatus, setOrderRefund, confirmOrder, findUnconfirmedAuto, getOrderPageId } from "@/lib/orders";
 import { getConversationPageId } from "@/lib/conversations";
 import { getScope, canSeePage } from "@/lib/auth";
+import { getProducts } from "@/lib/products";
+import { validateOrder } from "@/lib/orderFacts";
 
 const DENY = () => NextResponse.json({ error: "Bạn không có quyền với đơn này." }, { status: 403 });
 
@@ -27,15 +29,27 @@ export async function GET(req) {
 // Lưu đơn (có id → sửa đơn cũ, không có id → tạo đơn mới)
 export async function POST(req) {
   try {
-    const { conversationId, pageId, id, order } = await req.json();
+    const { conversationId, pageId, id: givenId, order } = await req.json();
     if (!conversationId || !order) return NextResponse.json({ error: "Thiếu dữ liệu đơn" }, { status: 400 });
     // Quyền kiểm tra theo Page THẬT của cuộc chat, không tin pageId client gửi lên
     const realPageId = await getConversationPageId(conversationId);
     const scope = await getScope(req);
     if (!canSeePage(scope, realPageId)) return DENY();
-    if (id && !scope.isOwner && (await getOrderPageId(id)) !== realPageId) return DENY();
-    const newId = await saveOrder(conversationId, scope.isOwner ? pageId : realPageId, order, id);
-    return NextResponse.json({ ok: true, id: newId });
+    if (givenId && !scope.isOwner && (await getOrderPageId(givenId)) !== realPageId) return DENY();
+    // Khách này đã có đơn TỰ TẠO (khi khách để lại SĐT) mà chưa ai xác nhận → "Tạo đơn" mới sẽ ghi đè lên đơn đó, không tạo thêm đơn trùng
+    let id = givenId;
+    if (!id) id = (await findUnconfirmedAuto(conversationId))?.id || null;
+    // Kiểm tra trước khi lưu: số lượng phải là số nguyên ≥ 1; lựa chọn lạ so với dữ liệu sản phẩm (vd chiều dài không có trong danh sách) chỉ cảnh báo
+    const product = (await getProducts().catch(() => [])).find((p) => String(p.id) === String(order.productId));
+    const { errors, warnings } = validateOrder({ ...order, quantity: Number(order.quantity) }, product);
+    if (errors.length) return NextResponse.json({ error: errors.join(" ") }, { status: 400 });
+    // Chủ shop/nhân viên tự lưu = đã xem và xác nhận → bỏ nhãn "tự tạo" và các cảnh báo cần xác minh
+    const { auto: _auto, aiTries: _t, nameFromProfile: _n, review: _r, ...rest } = order;
+    const clean = { ...rest, quantity: Math.round(Number(order.quantity)) };
+    // Chủ shop đã sửa số lượng tay làm "lines" (số lượng từng dòng) không còn khớp → bỏ lines, giữ variant + quantity để không có hai nguồn mâu thuẫn
+    if (Array.isArray(clean.lines) && clean.lines.reduce((a, l) => a + (Number(l?.qty) || 0), 0) !== clean.quantity) delete clean.lines;
+    const newId = await saveOrder(conversationId, scope.isOwner ? pageId : realPageId, clean, id);
+    return NextResponse.json({ ok: true, id: newId, warnings });
   } catch (err) {
     return NextResponse.json({ error: String(err.message || err) }, { status: 500 });
   }
@@ -44,10 +58,12 @@ export async function POST(req) {
 // Tick tình trạng đơn bằng tay
 export async function PATCH(req) {
   try {
-    const { id, status } = await req.json();
-    if (!id || !status) return NextResponse.json({ error: "Thiếu dữ liệu" }, { status: 400 });
+    const { id, status, confirm, refund } = await req.json();
+    if (!id || (!status && !confirm && refund === undefined)) return NextResponse.json({ error: "Thiếu dữ liệu" }, { status: 400 });
     if (!canSeePage(await getScope(req), await getOrderPageId(id))) return DENY();
-    await setOrderStatus(id, status);
+    if (status) await setOrderStatus(id, status);
+    if (refund !== undefined) await setOrderRefund(id, refund);
+    if (confirm) await confirmOrder(id); // xác nhận đơn tự tạo (vd: đã ghi vào doanh thu)
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json({ error: String(err.message || err) }, { status: 500 });
